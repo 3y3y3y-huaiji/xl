@@ -1,69 +1,104 @@
-package io.github.ryf5584.wxdbdump.xposed
+package androidx.sqlite.db.framework
 
-import com.highcapable.yukihookapi.annotation.xposed.InjectYukiHookWithXposed
-import com.highcapable.yukihookapi.hook.entity.YukiBaseHooker
-import com.highcapable.yukihookapi.hook.factory.configs
-import com.highcapable.yukihookapi.hook.factory.encase
-import com.highcapable.yukihookapi.hook.xposed.proxy.IYukiHookXposedInit
+import android.app.Application
+import android.content.Context
+import androidx.annotation.Keep
+import de.robv.android.xposed.IXposedHookLoadPackage
+import de.robv.android.xposed.XC_MethodHook
+import de.robv.android.xposed.XposedBridge
+import de.robv.android.xposed.XposedHelpers
+import de.robv.android.xposed.callbacks.XC_LoadPackage
 import io.github.ryf5584.wxdbdump.payload.Log
 import io.github.ryf5584.wxdbdump.payload.proto.Channel
+import io.github.ryf5584.wxdbdump.xposed.LoopbackServer
+import io.github.ryf5584.wxdbdump.xposed.WxDbEngine
+import io.github.ryf5584.wxdbdump.xposed.XposedHost
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Stealth YukiHookAPI entry point.
- *
- * <p>Anti-detection measures inside the host process:
- * <ul>
- *   <li>External logcat and stdout output is silenced completely (`Log.setSilentExternal(true)`),
- *       so WeChat's in-process logcat scanner sees zero `WxDbExport` lines.</li>
- *   <li>`Thread.setDefaultUncaughtExceptionHandler` is never touched, preserving WeChat's own
- *       Matrix/crash handler chain untouched.</li>
- *   <li>No `onHandleLoadPackage` banner or extra Xposed event callbacks are registered.</li>
- * </ul>
+ * Pure IXposedHookLoadPackage entry point with zero third-party hook framework (no YukiHookAPI,
+ * no KavaRef, no parasitic ActivityManager/Instrumentation/Handler proxies, no BroadcastReceiver).
  */
-@InjectYukiHookWithXposed
-object HookEntry : IYukiHookXposedInit {
+@Keep
+class CompatOpenHelper : IXposedHookLoadPackage {
 
-    override fun onInit() {
+    override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
+        if (lpparam.packageName != WECHAT_PKG) return
         Log.setSilentExternal(true)
-        configs {
-            isDebug = false
-            isEnableModuleAppResourcesCache = false
-            isEnableHookSharedPreferences = false
-            isEnableDataChannel = false
-        }
+        installOnWeChat(lpparam)
     }
 
-    override fun onHook() = encase(WxDbExportHooker())
-}
+    private fun installOnWeChat(lpparam: XC_LoadPackage.LoadPackageParam) {
+        val process = lpparam.processName ?: WECHAT_PKG
+        val isMain = process == WECHAT_PKG
 
-/** Runs once per WeChat process. */
-class WxDbExportHooker : YukiBaseHooker() {
-
-    override fun onHook() {
-        onAppLifecycle {
-            onCreate { startEngine() }
-        }
-    }
-
-    private fun startEngine() {
         try {
-            Log.setSilentExternal(true)
-            val app = appContext ?: return
-            val proc = XposedHost.currentProcessName(app)
-            if (WECHAT_MAIN_PROCESS != proc) {
-                return
-            }
+            XposedHelpers.findAndHookMethod(
+                Application::class.java,
+                "attach",
+                Context::class.java,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val app = param.thisObject as? Application ?: return
+                        val base = param.args.firstOrNull() as? Context ?: app
+                        val effectiveLoader = base.classLoader ?: app.classLoader ?: lpparam.classLoader
+                        onWeChatReady(app, effectiveLoader, process, isMain)
+                    }
+                },
+            )
+        } catch (_: Throwable) {
+        }
 
-            val host = XposedHost(app, appClassLoader, proc)
-            val engine = WxDbEngine(host)
-            engine.installHooks()
-            LoopbackServer(engine, Channel.PORT, Channel.TOKEN).start()
-        } catch (ignored: Throwable) {
-            // Never crash or log into WeChat
+        try {
+            XposedHelpers.findAndHookMethod(
+                Application::class.java,
+                "onCreate",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val app = param.thisObject as? Application ?: return
+                        onWeChatReady(app, app.classLoader ?: lpparam.classLoader, process, isMain)
+                    }
+                },
+            )
+        } catch (_: Throwable) {
         }
     }
 
-    private companion object {
-        const val WECHAT_MAIN_PROCESS = "com.tencent.mm"
+    private fun onWeChatReady(
+        app: Application,
+        loader: ClassLoader,
+        process: String,
+        isMain: Boolean,
+    ) {
+        if (!started.compareAndSet(false, true)) return
+
+        try {
+            val host = XposedHost(app, loader, process)
+            val eng = WxDbEngine(host)
+            engine = eng
+
+            eng.installHooks()
+
+            if (isMain) {
+                val s = LoopbackServer(eng, Channel.PORT)
+                s.start()
+                server = s
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
+    companion object {
+        const val WECHAT_PKG = "com.tencent.mm"
+        private val started = AtomicBoolean(false)
+
+        @Volatile
+        private var engine: WxDbEngine? = null
+
+        @Volatile
+        private var server: LoopbackServer? = null
+
+        @Suppress("unused")
+        private val keepBridgeRef = XposedBridge::class.java
     }
 }

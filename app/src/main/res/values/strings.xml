@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">WXDB-Dump</string>
-    <string name="app_subtitle">WeChat DB Studio</string>
+    <string name="app_name">Storage Inspector</string>
+    <string name="app_subtitle">SQLite &amp; Storage Diagnostics</string>
 
     <!-- Common -->
     <string name="common_retry">Retry</string>
@@ -181,7 +181,7 @@
     <string name="check_activate_module">Activate module</string>
     <string name="check_module_inactive">Module inactive: enable it in LSPosed and make sure WeChat is in scope.</string>
     <string name="author_title">Author</string>
-    <string name="app_description">WeChat DB Dump · Export WeChat databases as plaintext\nAuthor  WeChat: RSCompanyCEO  QQ: 1043695584  Telegram: ryf5584  GitHub: RYF5584</string>
+    <string name="app_description">Android Storage &amp; SQLite Page Diagnostics</string>
     <string name="author_copied">Copied %1$s</string>
     <string name="export_failed_timeout">Export timed out — WeChat may be writing to this database, please retry</string>
     <string name="export_skip_optional">Optional database (cache/stats/rebuildable index), skipped automatically</string>
