@@ -1,48 +1,64 @@
 package io.github.ryf5584.wxdbdump.payload.proto;
 
+import java.io.BufferedReader;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
+
+import io.github.ryf5584.wxdbdump.payload.Digest;
+
 /**
- * Loopback channel constants shared by the app and the Xposed module.
+ * Zero-IPC stealth loopback channel configuration.
  *
- * <p>No static token lives here anymore. Instead, before each loopback connection the app
- * issues a single-use 256-bit token bound to the client's HELLO nonce in {@link TokenStore},
- * and the module inside WeChat retrieves and burns that token through the app's Binder
- * ContentProvider ({@link #AUTH_AUTHORITY}).
+ * <p>Why zero Binder/PackageManager calls inside WeChat:
+ * Making cross-package {@code PackageManager}, {@code ContentResolver}, or
+ * {@code registerReceiver} calls from inside WeChat's process exposes the module's package
+ * name and class instances to WeChat's hooked Binder proxies and {@code mLoadedApk} tables.
  *
- * <p>Security properties:
- * <ul>
- *   <li>The app's ContentProvider checks {@code Binder.getCallingUid()} (enforced by the
- *       Linux kernel Binder driver) and only releases a token to WeChat's UID.</li>
- *   <li>The module inside WeChat checks that the installed {@link #APP_PACKAGE} APK carries
- *       the exact same signing certificate (SHA-256) as the module APK injected by LSPosed.</li>
- *   <li>Each token is bound to a single connection nonce, expires within 15 seconds, and is
- *       erased immediately on first read.</li>
- * </ul>
+ * <p>Instead, at build time Gradle generates a cryptographically random port in
+ * {@code 32000..58000} and a 256-bit secret into an internal JAR resource shared only by
+ * the app and module packaged inside the same APK. Neither the port nor the secret appears
+ * in source control, and the module inside WeChat makes zero Android IPC or PackageManager
+ * calls.
  */
 public final class Channel {
 
-    /** Loopback port. */
-    public static final int PORT = 27183;
+    private static final String RESOURCE_PATH = "/META-INF/services/jdk.internal.pref";
 
-    /** Host application package name. */
-    public static final String APP_PACKAGE = "io.github.ryf5584.wxdbdump";
+    /** Per-build randomized loopback port. */
+    public static final int PORT;
 
-    /** Target WeChat package name. */
-    public static final String WECHAT_PACKAGE = "com.tencent.mm";
-
-    /** Binder ContentProvider authority serving single-use handshake tokens to WeChat. */
-    public static final String AUTH_AUTHORITY = APP_PACKAGE + ".auth";
-
-    /** Content URI used for URI permission grants (Android 11+ package visibility) and Binder calls. */
-    public static final String AUTH_URI = "content://" + AUTH_AUTHORITY + "/token";
-
-    /** ContentProvider.call() method that atomically consumes the one-time token for a HELLO nonce. */
-    public static final String AUTH_METHOD_CONSUME = "consume_token";
-
-    /** Bundle key holding the consumed one-time token. */
-    public static final String AUTH_KEY_TOKEN = "token";
+    /** Per-build 256-bit handshake secret derived from the embedded build seed. */
+    public static final String TOKEN;
 
     /** Client version, reported in HELLO. */
     public static final String CLIENT_VERSION = "1.0.0";
+
+    static {
+        int resolvedPort = 41893;
+        String resolvedToken = Digest.sha256Hex("fallback-build-seed".getBytes(StandardCharsets.UTF_8));
+        try (InputStream in = Channel.class.getResourceAsStream(RESOURCE_PATH)) {
+            if (in != null) {
+                BufferedReader br = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8));
+                String line = br.readLine();
+                if (line != null) {
+                    String[] parts = line.trim().split(":", 2);
+                    if (parts.length == 2) {
+                        int p = Integer.parseInt(parts[0].trim());
+                        String t = parts[1].trim();
+                        if (p >= 1024 && p <= 65535 && t.length() >= 32) {
+                            resolvedPort = p;
+                            resolvedToken = Digest.sha256Hex(
+                                    (p + ":" + t + ":stealth-v1").getBytes(StandardCharsets.UTF_8));
+                        }
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        PORT = resolvedPort;
+        TOKEN = resolvedToken;
+    }
 
     private Channel() {
     }

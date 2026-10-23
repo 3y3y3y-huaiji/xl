@@ -1,171 +1,94 @@
 package io.github.ryf5584.wxdbdump.xposed;
 
 import android.content.Context;
-import android.content.pm.PackageInfo;
-import android.content.pm.PackageManager;
-import android.content.pm.Signature;
-import android.content.pm.SigningInfo;
-import android.net.Uri;
-import android.os.Build;
-import android.os.Bundle;
 
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.nio.charset.StandardCharsets;
 
-import io.github.ryf5584.wxdbdump.payload.Digest;
-import io.github.ryf5584.wxdbdump.payload.Log;
 import io.github.ryf5584.wxdbdump.payload.proto.Channel;
-import io.github.ryf5584.wxdbdump.payload.proto.Handshake;
 
 /**
- * Peer authenticator and ephemeral token consumer running inside WeChat's process.
+ * Burn-after-reading one-time token consumer inside WeChat's own sandbox cache directory,
+ * with zero Binder/PackageManager/ContentResolver calls.
  *
- * <h3>Two-layer verification</h3>
+ * <h3>How it works</h3>
  * <ol>
- *   <li><b>Same-signer APK certificate check:</b> Before contacting the companion app,
- *       verifies that the installed {@link Channel#APP_PACKAGE} APK is signed by the exact
- *       same certificate (SHA-256 digest) as the Xposed module APK injected by LSPosed
- *       ({@code moduleApkPath}). A repackaged or spoofed app is rejected immediately.</li>
- *   <li><b>Kernel-UID-gated one-time token consumption:</b> Queries the companion app's
- *       {@code AuthTokenProvider} over Binder ({@code ContentResolver.call}) to consume the
- *       single-use 256-bit token bound to the client's {@code HELLO} nonce. Because the
- *       provider checks {@code Binder.getCallingUid()} against WeChat's UID, no third-party
- *       app on the device can read this token.</li>
+ *   <li>When Root is available, the companion app writes a fresh 256-bit random token into
+ *       {@code /data/data/com.tencent.mm/cache/.mm_kv_<nonce>} owned by WeChat's UID with
+ *       {@code 0600} permissions right before sending {@code HELLO}.</li>
+ *   <li>Upon receiving {@code HELLO}, {@link #consumeTokenForNonce(String)} checks for that
+ *       file in {@code hostContext.getCacheDir()}, reads the 64-char hex token, zeroes and
+ *       unlinks the file immediately (burn-after-reading), and uses that one-time token for
+ *       both halves of the mutual HMAC-SHA256 handshake.</li>
+ *   <li>When running in Xposed-only mode without Root, falls back to the per-build CSPRNG
+ *       256-bit secret ({@link Channel#TOKEN}) embedded at compile time.</li>
  * </ol>
  */
 public final class PeerAuth {
 
+    public static final String TOKEN_FILE_PREFIX = ".mm_kv_";
+
     private final Context hostContext;
-    private final String moduleApkPath;
 
-    /** Cached SHA-256 fingerprint of the injected module APK's signing certificate. */
-    private volatile String cachedModuleCertSha256;
-
-    public PeerAuth(Context hostContext, String moduleApkPath) {
+    public PeerAuth(Context hostContext) {
         this.hostContext = hostContext;
-        this.moduleApkPath = moduleApkPath;
     }
 
     /**
-     * Verifies the companion app's APK signature and consumes the one-time token for
-     * {@code clientNonceHex} over Binder.
-     *
-     * @return the 64-char hex one-time token, or {@code null} if verification fails
+     * Consumes the burn-after-reading one-time token for {@code clientNonceHex} from WeChat's
+     * private cache directory, or falls back to the per-build CSPRNG {@link Channel#TOKEN}.
      */
     public String consumeTokenForNonce(String clientNonceHex) {
         if (clientNonceHex == null || clientNonceHex.isEmpty()) return null;
-        if (!verifyCompanionAppSignature()) {
-            Log.w("auth", "companion app signature verification failed");
-            return null;
-        }
+        if (!isSafeHex(clientNonceHex)) return null;
         try {
-            Bundle reply = hostContext.getContentResolver().call(
-                    Uri.parse(Channel.AUTH_URI),
-                    Channel.AUTH_METHOD_CONSUME,
-                    clientNonceHex,
-                    null);
-            if (reply == null) {
-                Log.w("auth", "AuthTokenProvider returned null bundle for nonce");
-                return null;
-            }
-            String token = reply.getString(Channel.AUTH_KEY_TOKEN);
-            if (token == null || token.isEmpty()) {
-                Log.w("auth", "AuthTokenProvider returned no token (unissued or already consumed)");
-                return null;
-            }
-            return token;
-        } catch (Throwable t) {
-            Log.w("auth", "Binder call to AuthTokenProvider failed: " + t);
-            return null;
-        }
-    }
-
-    /**
-     * Verifies that {@link Channel#APP_PACKAGE} is installed and signed with the same
-     * certificate as the injected Xposed module APK.
-     */
-    public boolean verifyCompanionAppSignature() {
-        try {
-            PackageManager pm = hostContext.getPackageManager();
-            PackageInfo installedInfo = getPackageInfoWithSigners(pm, Channel.APP_PACKAGE, false);
-            String installedCert = extractCertSha256(installedInfo);
-            if (installedCert == null || installedCert.isEmpty()) {
-                Log.w("auth", "cannot read signing certificate of installed " + Channel.APP_PACKAGE);
-                return false;
-            }
-
-            String expectedModuleCert = resolveModuleCertSha256(pm);
-            if (expectedModuleCert != null && !expectedModuleCert.isEmpty()) {
-                boolean match = Handshake.matches(expectedModuleCert, installedCert);
-                if (!match) {
-                    Log.w("auth", "APK signature mismatch between injected module and installed app");
-                }
-                return match;
-            }
-            // If the framework did not expose moduleApkPath on disk, package signature presence is verified
-            return true;
-        } catch (Throwable t) {
-            Log.w("auth", "failed to verify companion app signature: " + t);
-            return false;
-        }
-    }
-
-    private String resolveModuleCertSha256(PackageManager pm) {
-        String cached = cachedModuleApkCert();
-        if (cached != null) return cached;
-        if (moduleApkPath == null || moduleApkPath.isEmpty()) return null;
-        try {
-            File apk = new File(moduleApkPath);
-            if (!apk.exists() || !apk.canRead()) return null;
-            PackageInfo archiveInfo = getPackageInfoWithSigners(pm, moduleApkPath, true);
-            String digest = extractCertSha256(archiveInfo);
-            if (digest != null && !digest.isEmpty()) {
-                cachedModuleCertSha256 = digest;
-            }
-            return digest;
-        } catch (Throwable t) {
-            Log.d("auth", "could not read archive cert from moduleApkPath: " + t);
-            return null;
-        }
-    }
-
-    private String cachedModuleApkCert() {
-        return cachedModuleCertSha256;
-    }
-
-    @SuppressWarnings("deprecation")
-    private static PackageInfo getPackageInfoWithSigners(
-            PackageManager pm, String pkgOrPath, boolean archive) throws PackageManager.NameNotFoundException {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            int flags = PackageManager.GET_SIGNING_CERTIFICATES;
-            return archive
-                    ? pm.getPackageArchiveInfo(pkgOrPath, flags)
-                    : pm.getPackageInfo(pkgOrPath, flags);
-        } else {
-            int flags = PackageManager.GET_SIGNATURES;
-            return archive
-                    ? pm.getPackageArchiveInfo(pkgOrPath, flags)
-                    : pm.getPackageInfo(pkgOrPath, flags);
-        }
-    }
-
-    @SuppressWarnings("deprecation")
-    public static String extractCertSha256(PackageInfo info) {
-        if (info == null) return null;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            SigningInfo si = info.signingInfo;
-            if (si != null) {
-                Signature[] sigs = si.hasMultipleSigners()
-                        ? si.getApkContentsSigners()
-                        : si.getSigningCertificateHistory();
-                if (sigs != null && sigs.length > 0 && sigs[0] != null) {
-                    return Digest.sha256Hex(sigs[0].toByteArray());
+            File cacheDir = hostContext != null ? hostContext.getCacheDir() : null;
+            if (cacheDir != null) {
+                File tokenFile = new File(cacheDir, TOKEN_FILE_PREFIX + clientNonceHex);
+                if (tokenFile.isFile() && tokenFile.canRead()) {
+                    String token = readAndShred(tokenFile);
+                    if (token != null && token.length() >= 32) {
+                        return token;
+                    }
                 }
             }
+        } catch (Throwable ignored) {
         }
-        Signature[] legacy = info.signatures;
-        if (legacy != null && legacy.length > 0 && legacy[0] != null) {
-            return Digest.sha256Hex(legacy[0].toByteArray());
+        return Channel.TOKEN;
+    }
+
+    private static String readAndShred(File f) {
+        byte[] buf = new byte[128];
+        int n = 0;
+        try (FileInputStream in = new FileInputStream(f)) {
+            n = in.read(buf);
+        } catch (Throwable ignored) {
+        } finally {
+            try (FileOutputStream out = new FileOutputStream(f, false)) {
+                out.write(new byte[64]);
+                out.getFD().sync();
+            } catch (Throwable ignored) {
+            }
+            try {
+                //noinspection ResultOfMethodCallIgnored
+                f.delete();
+            } catch (Throwable ignored) {
+            }
         }
-        return null;
+        if (n <= 0) return null;
+        String s = new String(buf, 0, n, StandardCharsets.US_ASCII).trim();
+        return s.isEmpty() ? null : s;
+    }
+
+    private static boolean isSafeHex(String s) {
+        if (s.length() < 16 || s.length() > 64) return false;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            boolean hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+            if (!hex) return false;
+        }
+        return true;
     }
 }

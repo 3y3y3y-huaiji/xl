@@ -1,151 +1,126 @@
 package io.github.ryf5584.wxdbdump.xposed
 
 import android.app.Application
+import android.content.Context
+import android.os.Build
 import com.highcapable.yukihookapi.annotation.xposed.InjectYukiHookWithXposed
-import com.highcapable.yukihookapi.hook.entity.YukiBaseHooker
 import com.highcapable.yukihookapi.hook.factory.configs
 import com.highcapable.yukihookapi.hook.factory.encase
-import com.highcapable.yukihookapi.hook.xposed.bridge.event.YukiXposedEvent
+import com.highcapable.yukihookapi.hook.type.android.ApplicationClass
 import com.highcapable.yukihookapi.hook.xposed.proxy.IYukiHookXposedInit
+import de.robv.android.xposed.XC_MethodHook
+import de.robv.android.xposed.XposedBridge
+import de.robv.android.xposed.XposedHelpers
+import de.robv.android.xposed.callbacks.XC_LoadPackage
 import io.github.ryf5584.wxdbdump.payload.Log
 import io.github.ryf5584.wxdbdump.payload.proto.Channel
+import java.util.concurrent.atomic.AtomicBoolean
 
-/**
- * YukiHookAPI entry point.
- *
- * Layering:
- *   the Kotlin layer in this file only decides how to start the engine inside WeChat;
- *   {@code payload} (pure Java) owns what to enumerate, what to hook and how to export.
- *
- * Logging: the logcat tag is fixed, so one {@code adb logcat -s WxDbExport:* *:S} captures
- * both WeChat's process and this app; process identity travels inside the message body.
- */
-@InjectYukiHookWithXposed
-object HookEntry : IYukiHookXposedInit {
+@InjectYukiHookWithXposed(isUsingResourcesHook = false)
+class HookEntry : IYukiHookXposedInit {
 
-    override fun onInit() {
-        // Attach the log channel here: the diagnostics in onHandleLoadPackage come after this,
-        // and attaching later loses every message emitted during injection.
-        Log.tryLogcat()
-        Log.init("xposed-init")
-        Log.banner(
-            "MODULE ONINIT",
-            "module=${BuildConfig.APPLICATION_ID}\nlogcatReady=${Log.logcatReady()}\n" +
-                "tip: adb logcat -s WxDbExport:* *:S",
-        )
-
-        configs {
-            isDebug = false
-            // Resources, SharedPreferences and DataChannel are unused; turning them off limits side effects
-            isEnableModuleAppResourcesCache = false
-            isEnableHookSharedPreferences = false
-            isEnableDataChannel = false
+    override fun onInit() = configs {
+        isDebug = false
+        debugLog {
+            tag = "zygote"
+            isEnable = false
         }
     }
 
-    /**
-     * Diagnostics: confirms whether the module was injected at all, and shows the host loader.
-     * This is the quickest signal when checking whether LSPosed is working.
-     */
+    override fun onHook() = encase {
+        // Silent inside WeChat
+    }
+
     override fun onXposedEvent() {
-        YukiXposedEvent.onHandleLoadPackage { lpp ->
-            Log.banner(
-                "MODULE INJECTED",
-                "pkg=${lpp.packageName}\nproc=${lpp.processName}\n" +
-                    "loader=${lpp.classLoader?.javaClass?.name ?: "null"}",
-            )
+        com.highcapable.yukihookapi.hook.xposed.bridge.event.YukiXposedEvent.onHandleLoadPackage { lpparam ->
+            if (lpparam.packageName != WECHAT_PKG) return@onHandleLoadPackage
+            Log.setSilentExternal(true)
+            installOnWeChat(lpparam)
         }
     }
 
-    override fun onHook() = encase(WxDbExportHooker())
-}
+    private fun installOnWeChat(lpparam: XC_LoadPackage.LoadPackageParam) {
+        val process = lpparam.processName ?: WECHAT_PKG
+        val isMain = process == WECHAT_PKG
 
-/** Runs once per WeChat process. */
-class WxDbExportHooker : YukiBaseHooker() {
-
-    override fun onHook() {
-        Log.banner("MODULE ONHOOK", "hooker loading (may run once in the zygote domain)")
-        // Engine bootstrap, after Application.onCreate. This callback is only the entry point;
-        // readiness is decided inside the engine (see startEngine()).
-        onAppLifecycle {
-            onCreate { startEngine() }
-        }
-    }
-
-    /**
-     * Starts the engine in WeChat's main process only:
-     *   - only the main process opens those encrypted databases
-     *   - the loopback port is global, so a second bind would fail
-     */
-    private fun startEngine() {
         try {
-            Log.tryLogcat()
-            val app = appContext ?: run {
-                Log.e("boot", "appContext is null, cannot start the engine")
-                return
-            }
-            val proc = XposedHost.currentProcessName(app)
-            Log.init(proc)
-
-            Log.banner(
-                "ENGINE START",
-                "proc=$proc\npid=${android.os.Process.myPid()}\n" +
-                    "appClassLoader=${appClassLoader?.javaClass?.name}\n" +
-                    "logcatReady=${Log.logcatReady()}",
+            XposedHelpers.findAndHookMethod(
+                Application::class.java,
+                "attach",
+                Context::class.java,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val app = param.thisObject as? Application ?: return
+                        val base = param.args.firstOrNull() as? Context ?: app
+                        val effectiveLoader = base.classLoader ?: app.classLoader ?: lpparam.classLoader
+                        onWeChatReady(app, effectiveLoader, process, isMain)
+                    }
+                },
             )
+        } catch (t: Throwable) {
+            // Silent
+        }
 
-            installUncaughtHandler()
+        try {
+            XposedHelpers.findAndHookMethod(
+                Application::class.java,
+                "onCreate",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val app = param.thisObject as? Application ?: return
+                        onWeChatReady(app, app.classLoader ?: lpparam.classLoader, process, isMain)
+                    }
+                },
+            )
+        } catch (t: Throwable) {
+            // Silent
+        }
+    }
 
-            if (WECHAT_MAIN_PROCESS != proc) {
-                Log.i("boot", "not the main process ($proc), engine not started")
-                return
-            }
+    private fun onWeChatReady(
+        app: Application,
+        loader: ClassLoader,
+        process: String,
+        isMain: Boolean,
+    ) {
+        if (!started.compareAndSet(false, true)) return
 
-            val host = XposedHost(app, appClassLoader, proc)
+        try {
+            val host = XposedHost(app, loader, process)
             val engine = WxDbEngine(host)
+            this.engine = engine
 
-            // Install hooks on the unobfuscated com.tencent.wcdb.* classes, watching for classes
-// that have not loaded yet and retrying on a timer
-            val report = engine.installHooks()
-            Log.i("hook", "hook installation summary: $report")
+            val hookSummary = engine.installHooks()
 
-            // Start the loopback server with Binder UID + APK signature gated one-time tokens
-            val peerAuth = PeerAuth(app, moduleAppFilePath)
-            LoopbackServer(engine, Channel.PORT, peerAuth).start()
+            if (isMain) {
+                val peerAuth = PeerAuth(app)
+                val s = LoopbackServer(engine, Channel.PORT, peerAuth)
+                s.start()
+                this.server = s
+            }
+            Log.banner(
+                "WECHAT READY",
+                "proc=$process (isMain=$isMain) pid=${android.os.Process.myPid()}\n" +
+                    "sdk=${Build.VERSION.SDK_INT} abi=${Build.SUPPORTED_ABIS.firstOrNull()}\n" +
+                    "hooks=$hookSummary\n" +
+                    "loopback=${if (isMain) "127.0.0.1:${Channel.PORT}" else "disabled"}",
+            )
         } catch (t: Throwable) {
             // Never crash WeChat
-            Log.banner("ENGINE FAILED", Log.stack(t, 20))
-            Log.e("boot", "engine bootstrap failed; WeChat keeps running", t)
         }
     }
 
-    /**
-     * Last-resort handler. It must chain to the previous handler, or WeChat's own crash
-     * reporting is swallowed. Background threads have no other trace.
-     */
-    private fun installUncaughtHandler() {
-        try {
-            val prev = Thread.getDefaultUncaughtExceptionHandler()
-            Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
-                try {
-                    Log.banner(
-                        "UNCAUGHT EXCEPTION (wechat proc)",
-                        "thread=${thread?.name}\n" + Log.stack(throwable, 24),
-                    )
-                } catch (ignored: Throwable) {
-                }
-                try {
-                    prev?.uncaughtException(thread, throwable)
-                } catch (ignored: Throwable) {
-                }
-            }
-            Log.i("boot", "uncaught handler installed (prev=${prev?.javaClass?.name})")
-        } catch (t: Throwable) {
-            Log.w("boot", "failed to install the uncaught handler (acceptable)", t)
-        }
-    }
+    companion object {
+        const val WECHAT_PKG = "com.tencent.mm"
+        private val started = AtomicBoolean(false)
 
-    private companion object {
-        const val WECHAT_MAIN_PROCESS = "com.tencent.mm"
+        @Volatile
+        private var engine: WxDbEngine? = null
+
+        @Volatile
+        private var server: LoopbackServer? = null
+
+        @Suppress("unused")
+        private val keepBridgeRef = XposedBridge::class.java
     }
 }

@@ -106,19 +106,22 @@ public final class WxDbEngine {
         return dbs.isEmpty() ? null : dbs.get(0);
     }
 
-    /** Decrypts one database into dstPath using WeChat's own SQLCipher. */
-    public PlainDumper.Result dumpPlain(String srcPath, String dstPath) {
+    /** Inspects an encrypted database in memory without touching WCDB or writing to disk. */
+    public PlainDumper.Result inspectPlain(String srcPath) {
         KeyVault.DbKey k = vault.getForPath(srcPath);
         if (k == null) {
             return PlainDumper.Result.fail("no key for this account yet; opening WeChat captures it");
         }
-        ClassLoader cl = host.loader();
-        List<WcdbCipher.SpecOption> specs =
-                WcdbCipher.specOptions(cl, srcPath, k.pageSize > 0 ? k.pageSize : 0);
-        StringBuilder sb = new StringBuilder();
-        for (WcdbCipher.SpecOption o : specs) sb.append(o.label).append(' ');
-        Log.i("engine", "decrypting " + srcPath.substring(srcPath.lastIndexOf('/') + 1)
-                + " keyLen=" + k.key.length + " spec candidates=[" + sb.toString().trim() + "]");
-        return PlainDumper.export(cl, srcPath, k.key, specs, dstPath);
+        return PlainDumper.inspect(srcPath, k.key);
+    }
+
+    /** Streams decrypted database pages directly in memory into {@code sink}. */
+    public long streamPlain(
+            String srcPath,
+            PlainDumper.Result inspected,
+            io.github.ryf5584.wxdbdump.payload.crypto.SqlCipherPages.ChunkSink sink) throws Exception {
+        KeyVault.DbKey k = vault.getForPath(srcPath);
+        if (k == null) throw new IllegalStateException("no key for " + srcPath);
+        return PlainDumper.streamTo(inspected, k.key, sink);
     }
 }

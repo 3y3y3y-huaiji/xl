@@ -2,6 +2,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
+    <!-- Loopback connection to the Xposed module on 127.0.0.1:<per-build dynamic port> -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
@@ -46,12 +47,6 @@
             </intent-filter>
         </activity>
 
-        <!--
-          The open-folder action hands the export directory to a file manager as a content:// URI
-          with a temporary read grant. A file:// URI raises FileUriExposedException, and an
-          externalstorage document URI raises SecurityException for lack of a persisted grant.
-          FileProvider is the only approach that needs no extra user consent.
-        -->
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"
@@ -61,18 +56,6 @@
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_paths" />
         </provider>
-
-        <!--
-          Binder endpoint that delivers single-use 256-bit loopback handshake tokens to WeChat.
-          AuthTokenProvider checks Binder.getCallingUid() and rejects any caller other than
-          com.tencent.mm, while grantUriPermissions allows granting implicit package visibility
-          on Android 11+.
-        -->
-        <provider
-            android:name=".data.AuthTokenProvider"
-            android:authorities="${applicationId}.auth"
-            android:exported="true"
-            android:grantUriPermissions="true" />
 
     </application>
 

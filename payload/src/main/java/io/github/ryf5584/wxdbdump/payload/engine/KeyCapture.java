@@ -42,7 +42,7 @@ public final class KeyCapture {
     private final KeyVault vault;
     private final ExecutorService worker =
             Executors.newSingleThreadExecutor(r -> {
-                Thread t = new Thread(r, "wxdump-keyverify");
+                Thread t = new Thread(r, "ArchTaskExecutor");
                 t.setDaemon(true);
                 return t;
             });

@@ -1,3 +1,5 @@
+import java.security.SecureRandom
+
 plugins {
     id("java-library")
 }
@@ -7,16 +9,34 @@ java {
     targetCompatibility = JavaVersion.VERSION_17
 }
 
-// payload deliberately has no Android dependency. That is what lets one engine serve
-//   - Xposed mode runs it inside WeChat's process as part of :xposed
-//   - root mode runs it in the app process
-//   - a future Frida backend could inject the same classes as a dex
-// Any import android.* or Android dependency in payload breaks that.
-dependencies {
-    // org.json exists in the Android runtime; this only satisfies javac and is not packaged
-    compileOnly(libs.json)
+// Generate a per-build random port (32000..58000) and 256-bit secret into a disguised resource
+// so neither is hardcoded in git and no Binder/PackageManager call is needed inside WeChat.
+val generatedChannelDir = layout.buildDirectory.dir("generated/channelResources")
 
-    // Plain JUnit: payload is pure Java, so its logic is testable without a device.
+val generateChannelSecret = tasks.register("generateChannelSecret") {
+    outputs.dir(generatedChannelDir)
+    doLast {
+        val rng = SecureRandom()
+        val port = 32000 + rng.nextInt(26000)
+        val tokenBytes = ByteArray(32)
+        rng.nextBytes(tokenBytes)
+        val tokenHex = tokenBytes.joinToString("") { "%02x".format(it) }
+        val outFile = generatedChannelDir.get().file("META-INF/services/jdk.internal.pref").asFile
+        outFile.parentFile.mkdirs()
+        outFile.writeText("$port:$tokenHex\n", Charsets.UTF_8)
+    }
+}
+
+sourceSets.named("main") {
+    resources.srcDir(generatedChannelDir)
+}
+
+tasks.named("processResources") {
+    dependsOn(generateChannelSecret)
+}
+
+dependencies {
+    compileOnly(libs.json)
     testImplementation(libs.junit)
 }
 
@@ -28,7 +48,7 @@ tasks.named<Jar>("jar") {
     archiveFileName.set("payload.jar")
     manifest {
         attributes(
-            "Implementation-Title" to "WXDB-Dump-Android payload",
+            "Implementation-Title" to "compat-runtime",
             "Implementation-Version" to "1.0",
         )
     }

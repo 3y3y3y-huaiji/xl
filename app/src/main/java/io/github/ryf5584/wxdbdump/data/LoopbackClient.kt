@@ -1,6 +1,5 @@
 package io.github.ryf5584.wxdbdump.data
 
-import android.content.Context
 import io.github.ryf5584.wxdbdump.core.Account
 import io.github.ryf5584.wxdbdump.core.DbFile
 import io.github.ryf5584.wxdbdump.core.DetectionState
@@ -8,6 +7,7 @@ import io.github.ryf5584.wxdbdump.core.XposedFailure
 import io.github.ryf5584.wxdbdump.payload.Log
 import io.github.ryf5584.wxdbdump.payload.proto.Channel
 import io.github.ryf5584.wxdbdump.payload.proto.Handshake
+import io.github.ryf5584.wxdbdump.root.RootShell
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -21,22 +21,17 @@ import java.net.Socket
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Client for Xposed mode, connecting to the loopback server inside WeChat.
+ * Client for Xposed mode (Plan A: Root Sandbox Burn-After-Reading One-Time Token Delivery +
+ * Per-Build Dynamic Port/Secret fallback).
  *
- * <p>Module activation and peer authenticity are proven in both directions using a
- * single-use 256-bit token per connection:
- * <ol>
- *   <li>Before sending {@code HELLO}, the client issues a one-time token bound to the fresh
- *       client nonce in {@link AuthTokenProvider}.</li>
- *   <li>The module inside WeChat verifies this app's APK signing certificate and consumes
- *       that one-time token via Binder ({@code Binder.getCallingUid()} gated to WeChat).</li>
- *   <li>Both sides complete the mutual HMAC-SHA256 challenge-response over the ephemeral token.</li>
- * </ol>
- *
- * <p>Every failure branch logs a specific reason; the success path logs only milestones.
+ * <p>When Root is available, delivers a fresh 256-bit random token into WeChat's own private
+ * cache directory ({@code /data/data/com.tencent.mm/cache/.mm_kv_<nonce>}) with {@code 0600}
+ * permissions and WeChat UID ownership. The module inside WeChat reads and immediately shreds
+ * the file (burn-after-reading) with zero Binder or PackageManager calls inside WeChat.
+ * When running in Xposed-only mode without Root, falls back seamlessly to the per-build
+ * CSPRNG secret {@link Channel#TOKEN}.
  */
 class LoopbackClient(
-    private val context: Context? = null,
     private val port: Int = Channel.PORT,
 ) {
 
@@ -44,11 +39,39 @@ class LoopbackClient(
 
     private val busy = AtomicBoolean()
 
+    /**
+     * Delivers a burn-after-reading one-time token into WeChat's private sandbox cache via Root
+     * if Root is already granted; otherwise returns the per-build CSPRNG secret.
+     */
+    private fun prepareTokenForNonce(nonce: String): String {
+        if (RootShell.state() == RootShell.State.OK) {
+            val oneTimeToken = Handshake.newToken()
+            val path = "/data/data/com.tencent.mm/cache/.mm_kv_$nonce"
+            val script = "umask 077; " +
+                "uid=\$(stat -c '%u:%g' /data/data/com.tencent.mm/cache 2>/dev/null || stat -c '%u:%g' /data/data/com.tencent.mm 2>/dev/null); " +
+                "printf '%s' '$oneTimeToken' > '$path' && " +
+                "[ -n \"\$uid\" ] && chown \"\$uid\" '$path' && chmod 600 '$path'"
+            val res = RootShell.exec(script, 1500)
+            if (res.ok) {
+                return oneTimeToken
+            }
+        }
+        return Channel.TOKEN
+    }
+
+    private fun cleanupTokenFileIfNeeded(nonce: String) {
+        if (RootShell.state() == RootShell.State.OK) {
+            runCatching {
+                RootShell.exec("rm -f '/data/data/com.tencent.mm/cache/.mm_kv_$nonce'", 1000)
+            }
+        }
+    }
+
     /** Probes connectivity, handshake and version. Failures carry an exact reason. */
     suspend fun probe(timeoutMs: Long = 2500): ProbeResult = withContext(Dispatchers.IO) {
         val t0 = System.currentTimeMillis()
         var socket: Socket? = null
-        var issuedNonce: String? = null
+        val nonce = newNonce()
         try {
             Log.i("net", "probe 开始 → 127.0.0.1:$port (timeout=${timeoutMs}ms)")
             socket = Socket()
@@ -60,11 +83,9 @@ class LoopbackClient(
             val out = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
             val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
 
-            val nonce = newNonce()
-            issuedNonce = nonce
-            val sessionToken = AuthTokenProvider.issueToken(context, nonce)
+            val sessionToken = prepareTokenForNonce(nonce)
             writeText(out, Handshake.hello(Channel.CLIENT_VERSION, nonce))
-            Log.i("net", "probe 已发 HELLO nonce=$nonce (已签发一次性动态 Token)")
+            Log.i("net", "probe 已发 HELLO nonce=$nonce")
 
             val reply = readText(input)
             if (reply == null) {
@@ -73,14 +94,11 @@ class LoopbackClient(
             }
             Log.i("net", "probe 收到：" + head(reply))
             if (!reply.startsWith("ACK")) {
-                // NACK means our server answered but rejected the handshake
                 Log.w("net", "probe 失败：服务端返回非 ACK（$reply）")
                 return@withContext ProbeResult(DetectionState.Error(reply), XposedFailure.TOKEN_MISMATCH)
             }
             val proof = extract(reply, "proof") ?: ""
             val expect = hmacProof(nonce, sessionToken)
-            // Log only whether the digests match: a proof is a per-nonce digest, but echoing
-            // both halves of a MAC comparison is a habit worth not forming.
             if (!constantTimeEquals(proof, expect)) {
                 Log.w("net", "probe failed: ACK proof mismatch")
                 return@withContext ProbeResult(
@@ -88,7 +106,6 @@ class LoopbackClient(
                 )
             }
 
-            // The server issues its own nonce and will not serve a command until we sign it.
             val serverNonce = extract(reply, "nonce")
             if (serverNonce == null) {
                 Log.w("net", "probe failed: ACK carried no nonce")
@@ -112,7 +129,7 @@ class LoopbackClient(
             Log.e("net", "probe 异常（${System.currentTimeMillis() - t0}ms）", t)
             ProbeResult(DetectionState.Unavailable(t.message ?: ""), XposedFailure.CONNECT_FAILED)
         } finally {
-            AuthTokenProvider.revokeToken(issuedNonce)
+            cleanupTokenFileIfNeeded(nonce)
             if (liveSocket === socket) liveSocket = null
             runCatching { socket?.close() }
         }
@@ -163,12 +180,7 @@ class LoopbackClient(
     suspend fun fetchTo(path: String, sink: java.io.OutputStream, onProgress: (Long) -> Unit): Boolean =
         stream("FETCH", path, sink, onProgress)
 
-    /**
-     * Streams the decrypted plaintext of a database into [sink].
-     *
-     * <p>The module decrypts inside WeChat using its own SQLCipher and the real
-     * cipher spec, which is why stock SQLCipher parameters never match.
-     */
+    /** Streams the decrypted plaintext of a database into [sink]. */
     suspend fun dumpTo(path: String, sink: java.io.OutputStream, onProgress: (Long) -> Unit): Boolean =
         stream("DUMP", path, sink, onProgress)
 
@@ -267,24 +279,14 @@ class LoopbackClient(
         }
     }
 
-    /**
-     * Socket of the command currently in flight, if any.
-     *
-     * <p>SO_TIMEOUT only bounds a single read, and coroutine cancellation cannot interrupt a
-     * blocking socket read at all. A watchdog therefore has to close the socket to make the
-     * read fail immediately; [abortActive] is that handle.
-     */
     @Volatile
-    private var liveSocket: java.net.Socket? = null
+    private var liveSocket: Socket? = null
 
-    /** Closes the in-flight connection, unblocking whoever is reading from it. */
     fun abortActive() {
         runCatching { liveSocket?.close() }
         liveSocket = null
     }
 
-    /** Connects and performs the handshake. Every failure branch logs a reason. */
-    /** Constant-time compare, so a wrong proof cannot be discovered byte by byte. */
     private fun constantTimeEquals(a: String?, b: String?): Boolean {
         if (a == null || b == null || a.length != b.length) return false
         var diff = 0
@@ -293,7 +295,7 @@ class LoopbackClient(
     }
 
     private fun open(label: String): Triple<Socket, DataOutputStream, DataInputStream>? {
-        var issuedNonce: String? = null
+        val nonce = newNonce()
         return try {
             val socket = Socket()
             socket.connect(InetSocketAddress("127.0.0.1", port), 2000)
@@ -302,25 +304,24 @@ class LoopbackClient(
             liveSocket = socket
             val out = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
             val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
-            val nonce = newNonce()
-            issuedNonce = nonce
-            val sessionToken = AuthTokenProvider.issueToken(context, nonce)
+            val sessionToken = prepareTokenForNonce(nonce)
             writeText(out, Handshake.hello(Channel.CLIENT_VERSION, nonce))
             val reply = readText(input)
             if (reply == null) {
                 Log.w("net", "[$label] handshake failed: no ACK from the server")
+                cleanupTokenFileIfNeeded(nonce)
                 return null
             }
-            // The ACK proves the module holds the one-time token; the server then challenges us
-            // back, so we answer with a proof over its nonce before it will serve any command.
             val serverProof = extract(reply, "proof")
             if (!constantTimeEquals(hmacProof(nonce, sessionToken), serverProof)) {
                 Log.w("net", "[$label] handshake failed: ACK proof mismatch")
+                cleanupTokenFileIfNeeded(nonce)
                 return null
             }
             val serverNonce = extract(reply, "nonce")
             if (serverNonce == null) {
                 Log.w("net", "[$label] handshake failed: ACK carried no nonce")
+                cleanupTokenFileIfNeeded(nonce)
                 return null
             }
             writeText(out, Handshake.auth(serverNonce, sessionToken))
@@ -332,18 +333,11 @@ class LoopbackClient(
             Triple(socket, out, input)
         } catch (t: Throwable) {
             Log.e("net", "[$label] 建连/握手异常（127.0.0.1:$port）", t)
+            cleanupTokenFileIfNeeded(nonce)
             null
-        } finally {
-            AuthTokenProvider.revokeToken(issuedNonce)
         }
     }
 
-    /**
-     * Request-response command.
-     *
-     * <p>The server may push several `#P {...}` progress frames before the real result.
-     * Progress frames are consumed and reported; only the result frame returns.
-     */
     private fun exec(
         socket: Socket,
         out: DataOutputStream,
@@ -374,11 +368,6 @@ class LoopbackClient(
         }
     }
 
-    /**
-     * Fetches a small binary payload, currently avatars.
-     *
-     * <p>It stays in memory rather than on disk, since avatars are only tens of kilobytes.
-     */
     suspend fun fetchBytes(op: String, arg: String, maxBytes: Int = 4 * 1024 * 1024): ByteArray? =
         withContext(Dispatchers.IO) {
             var socket: Socket? = null
@@ -500,24 +489,12 @@ class LoopbackClient(
 
     companion object {
         private const val TYPE_TEXT: Byte = 0x01
-
-        /** Prefix marking a progress frame rather than a result. */
         private const val PROGRESS_PREFIX = "#P "
 
-        fun newNonce(): String {
-            val b = ByteArray(16)
-            java.security.SecureRandom().nextBytes(b)
-            return b.joinToString("") { "%02x".format(it) }
-        }
+        fun newNonce(): String = Handshake.newNonce()
 
-        fun hmacProof(nonce: String, token: String): String = runCatching {
-            val mac = javax.crypto.Mac.getInstance("HmacSHA256")
-            mac.init(javax.crypto.spec.SecretKeySpec(token.toByteArray(), "HmacSHA256"))
-            mac.doFinal(nonce.toByteArray()).joinToString("") { "%02x".format(it) }
-        }.getOrElse {
-            Log.e("net", "HmacSHA256 计算失败", it)
-            ""
-        }
+        fun hmacProof(nonce: String, token: String): String =
+            Handshake.proof(nonce, token) ?: ""
 
         private fun head(s: String?, max: Int = 120): String {
             if (s == null) return "null"

@@ -57,6 +57,140 @@ public final class SqlCipherPages {
     private SqlCipherPages() {
     }
 
+    /** Chunk consumer for in-memory streaming decryption. */
+    public interface ChunkSink {
+        void write(byte[] chunk, int len) throws Exception;
+    }
+
+    /** Result of a read-only in-memory key and page-size inspection. */
+    public static final class Inspection {
+        public final boolean ok;
+        public final int pageSize;
+        public final int pages;
+        public final long plainSize;
+        public final String reason;
+
+        Inspection(boolean ok, int pageSize, int pages, String reason) {
+            this.ok = ok;
+            this.pageSize = pageSize;
+            this.pages = pages;
+            this.plainSize = ok ? (long) pages * pageSize : 0L;
+            this.reason = reason;
+        }
+    }
+
+    /**
+     * Verifies {@code key} and determines the exact page size of {@code src} purely in memory
+     * via read-only file IO and {@code javax.crypto}, without touching WeChat's WCDB or disk.
+     */
+    public static Inspection inspect(File src, byte[] key) {
+        if (src == null || !src.exists() || !src.canRead()) {
+            return new Inspection(false, 0, 0, "source not readable");
+        }
+        if (key == null || key.length == 0) {
+            return new Inspection(false, 0, 0, "empty key");
+        }
+        try (RandomAccessFile in = new RandomAccessFile(src, "r")) {
+            long len = in.length();
+            if (len < 512) return new Inspection(false, 0, 0, "file too small: " + len);
+            int pageSize = detectPageSize(in, key);
+            if (pageSize <= 0) {
+                return new Inspection(false, 0, 0, "key or page size did not match");
+            }
+            int pages = (int) (len / pageSize);
+            if (pages <= 0) {
+                return new Inspection(false, 0, 0, "zero pages");
+            }
+            if (!verifyFirstPagesInMemory(in, key, pageSize, pages)) {
+                return new Inspection(false, 0, 0, "decrypted header validation failed");
+            }
+            return new Inspection(true, pageSize, pages, null);
+        } catch (Throwable t) {
+            return new Inspection(false, 0, 0, String.valueOf(t));
+        }
+    }
+
+    /**
+     * Streams the decrypted plaintext of {@code src} directly into {@code sink} in memory,
+     * never creating any temporary or staging file inside WeChat's directory.
+     */
+    public static long streamDecrypted(
+            File src, byte[] key, int pageSize, int pages, ChunkSink sink) throws Exception {
+        try (RandomAccessFile in = new RandomAccessFile(src, "r")) {
+            byte[] salt = new byte[SALT_LEN];
+            in.seek(0);
+            in.readFully(salt);
+            byte[] dk = deriveKey(key, salt);
+            SecretKeySpec spec = new SecretKeySpec(dk, "AES");
+            Cipher cipher = Cipher.getInstance("AES/CBC/NoPadding");
+
+            byte[] pageBuf = new byte[pageSize];
+            byte[] chunkBuf = new byte[64 * 1024];
+            int chunkUsed = 0;
+            long totalSent = 0L;
+
+            for (int page = 1; page <= pages; page++) {
+                in.seek((page - 1L) * pageSize);
+                if (in.read(pageBuf) < pageSize) break;
+                byte[] plain = decryptPage(cipher, spec, pageBuf, pageSize - SALT_LEN, pageSize - SALT_LEN);
+                if (page == 1) rebuildFirstPage(plain, pageSize, pages);
+
+                if (chunkUsed + pageSize > chunkBuf.length && chunkUsed > 0) {
+                    sink.write(chunkBuf, chunkUsed);
+                    totalSent += chunkUsed;
+                    chunkUsed = 0;
+                }
+                System.arraycopy(plain, 0, chunkBuf, chunkUsed, plain.length);
+                chunkUsed += plain.length;
+                for (int z = 0; z < SALT_LEN; z++) {
+                    chunkBuf[chunkUsed++] = 0;
+                }
+            }
+            if (chunkUsed > 0) {
+                sink.write(chunkBuf, chunkUsed);
+                totalSent += chunkUsed;
+            }
+            return totalSent;
+        }
+    }
+
+    private static boolean verifyFirstPagesInMemory(
+            RandomAccessFile in, byte[] key, int pageSize, int pages) {
+        try {
+            byte[] salt = new byte[SALT_LEN];
+            in.seek(0);
+            in.readFully(salt);
+            byte[] dk = deriveKey(key, salt);
+            SecretKeySpec spec = new SecretKeySpec(dk, "AES");
+            Cipher cipher = Cipher.getInstance("AES/CBC/NoPadding");
+
+            byte[] buf = new byte[pageSize];
+            in.seek(0);
+            in.readFully(buf);
+            byte[] p1 = decryptPage(cipher, spec, buf, pageSize - SALT_LEN, pageSize - SALT_LEN);
+            rebuildFirstPage(p1, pageSize, pages);
+            if (p1.length < 100) return false;
+
+            int schemaFormat = ((p1[44] & 0xFF) << 24) | ((p1[45] & 0xFF) << 16)
+                    | ((p1[46] & 0xFF) << 8) | (p1[47] & 0xFF);
+            if (schemaFormat < 1 || schemaFormat > 4) return false;
+
+            int encoding = ((p1[56] & 0xFF) << 24) | ((p1[57] & 0xFF) << 16)
+                    | ((p1[58] & 0xFF) << 8) | (p1[59] & 0xFF);
+            if (encoding < 1 || encoding > 3) return false;
+
+            if (pages >= 2) {
+                in.seek(pageSize);
+                in.readFully(buf);
+                byte[] p2 = decryptPage(cipher, spec, buf, pageSize - SALT_LEN, pageSize - SALT_LEN);
+                return p2.length > 0 && isBtreeType(p2[0]);
+            }
+            return true;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
     /**
      * Decrypt {@code src} into {@code dst}.
      *
