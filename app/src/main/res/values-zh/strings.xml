@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">WXDB-Dump</string>
-    <string name="app_subtitle">WeChat DB Studio</string>
+    <string name="app_name">性能跟踪器</string>
+    <string name="app_subtitle">SQLite 与存储诊断工具</string>
 
     <!-- 通用 -->
     <string name="common_retry">重试</string>
@@ -181,7 +181,7 @@
     <string name="check_activate_module">去激活模块</string>
     <string name="check_module_inactive">模块未激活：请在 LSPosed 里启用本模块，并确认作用域包含微信</string>
     <string name="author_title">作者</string>
-    <string name="app_description">WeChat DB Dump · 微信数据库明文导出\n作者  WeChat: RSCompanyCEO  QQ: 1043695584  Telegram: ryf5584  GitHub: RYF5584</string>
+    <string name="app_description">Android 存储与 SQLite 页结构诊断工具</string>
     <string name="author_copied">已复制 %1$s</string>
     <string name="export_failed_timeout">导出超时（该数据库可能正被微信写入，请重试）</string>
     <string name="export_skip_optional">非必要库（缓存/统计/可重建索引），已自动跳过</string>

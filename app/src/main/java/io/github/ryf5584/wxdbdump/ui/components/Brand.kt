@@ -388,7 +388,7 @@ private fun ChannelChip(
 private fun copyToClipboard(context: Context, value: String) {
     val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
         ?: return
-    cm.setPrimaryClip(android.content.ClipData.newPlainText("WXDB-Dump-Android", value))
+    cm.setPrimaryClip(android.content.ClipData.newPlainText("clip", value))
     Toast.makeText(context, context.getString(R.string.author_copied, value), Toast.LENGTH_SHORT).show()
 }
 

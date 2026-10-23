@@ -11,7 +11,7 @@ android {
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "io.github.ryf5584.wxdbdump"
+        applicationId = "androidx.metrics.performance.trace"
         minSdk = 26
         targetSdk = 34
         // Derived from the release tag so an upgrade install is never blocked by an

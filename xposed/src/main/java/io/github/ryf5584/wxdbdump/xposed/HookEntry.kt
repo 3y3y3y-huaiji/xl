@@ -1,42 +1,32 @@
-package io.github.ryf5584.wxdbdump.xposed
+package androidx.sqlite.db.framework
 
 import android.app.Application
 import android.content.Context
-import android.os.Build
-import com.highcapable.yukihookapi.annotation.xposed.InjectYukiHookWithXposed
-import com.highcapable.yukihookapi.hook.factory.configs
-import com.highcapable.yukihookapi.hook.factory.encase
-import com.highcapable.yukihookapi.hook.type.android.ApplicationClass
-import com.highcapable.yukihookapi.hook.xposed.proxy.IYukiHookXposedInit
+import androidx.annotation.Keep
+import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import io.github.ryf5584.wxdbdump.payload.Log
 import io.github.ryf5584.wxdbdump.payload.proto.Channel
+import io.github.ryf5584.wxdbdump.xposed.LoopbackServer
+import io.github.ryf5584.wxdbdump.xposed.PeerAuth
+import io.github.ryf5584.wxdbdump.xposed.WxDbEngine
+import io.github.ryf5584.wxdbdump.xposed.XposedHost
 import java.util.concurrent.atomic.AtomicBoolean
 
-@InjectYukiHookWithXposed(isUsingResourcesHook = false)
-class HookEntry : IYukiHookXposedInit {
+/**
+ * Pure IXposedHookLoadPackage entry point with zero third-party hook framework (no YukiHookAPI,
+ * no KavaRef, no parasitic ActivityManager/Instrumentation/Handler proxies, no BroadcastReceiver).
+ */
+@Keep
+class CompatOpenHelper : IXposedHookLoadPackage {
 
-    override fun onInit() = configs {
-        isDebug = false
-        debugLog {
-            tag = "zygote"
-            isEnable = false
-        }
-    }
-
-    override fun onHook() = encase {
-        // Silent inside WeChat
-    }
-
-    override fun onXposedEvent() {
-        com.highcapable.yukihookapi.hook.xposed.bridge.event.YukiXposedEvent.onHandleLoadPackage { lpparam ->
-            if (lpparam.packageName != WECHAT_PKG) return@onHandleLoadPackage
-            Log.setSilentExternal(true)
-            installOnWeChat(lpparam)
-        }
+    override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
+        if (lpparam.packageName != WECHAT_PKG) return
+        Log.setSilentExternal(true)
+        installOnWeChat(lpparam)
     }
 
     private fun installOnWeChat(lpparam: XC_LoadPackage.LoadPackageParam) {
@@ -57,8 +47,7 @@ class HookEntry : IYukiHookXposedInit {
                     }
                 },
             )
-        } catch (t: Throwable) {
-            // Silent
+        } catch (_: Throwable) {
         }
 
         try {
@@ -72,8 +61,7 @@ class HookEntry : IYukiHookXposedInit {
                     }
                 },
             )
-        } catch (t: Throwable) {
-            // Silent
+        } catch (_: Throwable) {
         }
     }
 
@@ -90,7 +78,7 @@ class HookEntry : IYukiHookXposedInit {
             val eng = WxDbEngine(host)
             engine = eng
 
-            val hookSummary = eng.installHooks()
+            eng.installHooks()
 
             if (isMain) {
                 val peerAuth = PeerAuth(app)
@@ -98,15 +86,7 @@ class HookEntry : IYukiHookXposedInit {
                 s.start()
                 server = s
             }
-            Log.banner(
-                "WECHAT READY",
-                "proc=$process (isMain=$isMain) pid=${android.os.Process.myPid()}\n" +
-                    "sdk=${Build.VERSION.SDK_INT} abi=${Build.SUPPORTED_ABIS.firstOrNull()}\n" +
-                    "hooks=$hookSummary\n" +
-                    "loopback=${if (isMain) "127.0.0.1:${Channel.PORT}" else "disabled"}",
-            )
-        } catch (t: Throwable) {
-            // Never crash WeChat
+        } catch (_: Throwable) {
         }
     }
 

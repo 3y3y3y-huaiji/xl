@@ -20,7 +20,7 @@ import java.io.File
  */
 object StoragePaths {
 
-    const val DEFAULT_DIR_NAME = "WeChat-DB-Dump"
+    const val DEFAULT_DIR_NAME = "PerfTraces"
 
     private const val EXT_STORAGE_AUTHORITY = "com.android.externalstorage.documents"
 
