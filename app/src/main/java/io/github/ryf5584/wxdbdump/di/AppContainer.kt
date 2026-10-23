@@ -24,7 +24,7 @@ class AppContainer(val context: Context) {
 
     val settings = SettingsRepository(context)
 
-    val loopback = LoopbackClient(context)
+    val loopback = LoopbackClient()
 
     val xposedSource = XposedDataSource(context, loopback)
 

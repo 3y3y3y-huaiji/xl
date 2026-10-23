@@ -50,9 +50,9 @@ class LoopbackClient(
             val script = "umask 077; " +
                 "uid=\$(stat -c '%u:%g' /data/data/com.tencent.mm/cache 2>/dev/null || stat -c '%u:%g' /data/data/com.tencent.mm 2>/dev/null); " +
                 "printf '%s' '$oneTimeToken' > '$path' && " +
-                "[ -n \"\$uid\" ] && chown \"\$uid\" '$path' && chmod 600 '$path'"
-            val res = RootShell.exec(script, 1500)
-            if (res.ok) {
+                "[ -n \"\$uid\" ] && chown \"\$uid\" '$path' && chmod 600 '$path' && echo OK"
+            val res = RootShell.exec(script)
+            if (res != null && res.contains("OK")) {
                 return oneTimeToken
             }
         }
@@ -62,7 +62,7 @@ class LoopbackClient(
     private fun cleanupTokenFileIfNeeded(nonce: String) {
         if (RootShell.state() == RootShell.State.OK) {
             runCatching {
-                RootShell.exec("rm -f '/data/data/com.tencent.mm/cache/.mm_kv_$nonce'", 1000)
+                RootShell.exec("rm -f '/data/data/com.tencent.mm/cache/.mm_kv_$nonce'")
             }
         }
     }
