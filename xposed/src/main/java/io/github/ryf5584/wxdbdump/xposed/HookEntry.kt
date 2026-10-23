@@ -80,7 +80,7 @@ class CompatOpenHelper : IXposedHookLoadPackage {
             eng.installHooks()
 
             if (isMain) {
-                val s = LoopbackServer(eng, Channel.PORT)
+                val s = LoopbackServer(eng, Channel.PORT, Channel.TOKEN)
                 s.start()
                 server = s
             }
