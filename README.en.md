@@ -239,13 +239,15 @@ Xposed module · root extraction · KernelSU · Magisk · WCDB decrypt · 微信
 
 ## Security
 
-The Xposed channel's loopback server binds to `127.0.0.1` and requires a two-way HMAC
-handshake before it will accept a command. `TOKEN` is a build-time constant published with
-the source, however, so the handshake filters peers that have not read this repository
-rather than authenticating the caller.
+The Xposed channel's loopback server binds to `127.0.0.1` and authenticates every
+connection using **kernel-enforced Binder UID checks + same-signer APK certificate
+verification + single-use 256-bit dynamic tokens**:
 
-Prefer **root mode** if you do not trust the other apps on the device: it reads through
-`su` and opens no port at all.
+- Before each connection, the app issues an in-memory, single-use 256-bit token bound to
+  the connection's `HELLO` nonce;
+- The module inside WeChat verifies that the installed app APK shares the exact same
+  signing certificate (SHA-256) as the injected module APK, then consumes and burns the
+  token via `AuthTokenProvider` (which enforces `Binder.getCallingUid() == wechatUid`).
 
 See [SECURITY.md](SECURITY.md) for the full threat model.
 

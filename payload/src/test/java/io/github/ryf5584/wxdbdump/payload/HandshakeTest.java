@@ -11,10 +11,11 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import io.github.ryf5584.wxdbdump.payload.proto.Handshake;
+import io.github.ryf5584.wxdbdump.payload.proto.TokenStore;
 
 /**
- * The handshake is the only thing standing between another app on the device and the
- * decrypted databases, so its edge cases are worth pinning down.
+ * The handshake and single-use token store stand between another app on the device and the
+ * decrypted databases, so their edge cases are pinned down here.
  */
 class HandshakeTest {
 
@@ -62,19 +63,51 @@ class HandshakeTest {
     }
 
     @Test
-    @DisplayName("a proof cannot be produced when the inputs are missing")
+    @DisplayName("a proof cannot be produced when the inputs are missing or empty")
     void proofRefusesMissingInputs() {
         assertNull(Handshake.proof(null, TOKEN));
+        assertNull(Handshake.proof("", TOKEN));
         assertNull(Handshake.proof("nonce", null));
+        assertNull(Handshake.proof("nonce", ""));
     }
 
     @Test
-    @DisplayName("nonces differ between calls")
-    void noncesAreNotRepeated() {
+    @DisplayName("nonces and tokens differ between calls and have expected entropy")
+    void noncesAndTokensAreNotRepeated() {
         String a = Handshake.newNonce();
         assertNotNull(a);
         assertEquals(32, a.length(), "16 bytes as hex");
         assertNotEquals(a, Handshake.newNonce());
+
+        String t1 = Handshake.newToken();
+        assertNotNull(t1);
+        assertEquals(64, t1.length(), "32 bytes (256-bit) as hex");
+        assertNotEquals(t1, Handshake.newToken());
+    }
+
+    @Test
+    @DisplayName("TokenStore burns a token on first read and rejects replay or unknown nonces")
+    void tokenStoreBurnsOnFirstRead() {
+        TokenStore store = new TokenStore(15_000L);
+        String nonce = Handshake.newNonce();
+        String issued = store.issue(nonce);
+        assertNotNull(issued);
+        assertEquals(64, issued.length());
+
+        // First consume returns the token; second consume returns null (burn-on-read)
+        assertEquals(issued, store.consume(nonce));
+        assertNull(store.consume(nonce), "replayed consume must fail");
+        assertNull(store.consume("unknown-nonce"));
+    }
+
+    @Test
+    @DisplayName("TokenStore revokes unconsumed tokens explicitly")
+    void tokenStoreRevokesCleanly() {
+        TokenStore store = new TokenStore(15_000L);
+        String nonce = Handshake.newNonce();
+        store.issue(nonce);
+        store.revoke(nonce);
+        assertNull(store.consume(nonce));
     }
 
     @Test

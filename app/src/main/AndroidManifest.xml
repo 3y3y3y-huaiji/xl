@@ -62,6 +62,18 @@
                 android:resource="@xml/file_paths" />
         </provider>
 
+        <!--
+          Binder endpoint that delivers single-use 256-bit loopback handshake tokens to WeChat.
+          AuthTokenProvider checks Binder.getCallingUid() and rejects any caller other than
+          com.tencent.mm, while grantUriPermissions allows granting implicit package visibility
+          on Android 11+.
+        -->
+        <provider
+            android:name=".data.AuthTokenProvider"
+            android:authorities="${applicationId}.auth"
+            android:exported="true"
+            android:grantUriPermissions="true" />
+
     </application>
 
 </manifest>

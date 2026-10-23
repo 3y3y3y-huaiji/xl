@@ -45,6 +45,17 @@ public final class Digest {
         }
     }
 
+    /** 64-character lowercase hex SHA-256, used for APK signing certificate fingerprints. */
+    public static String sha256Hex(byte[] data) {
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            md.update(data == null ? new byte[0] : data);
+            return bytesToHex(md.digest());
+        } catch (Throwable t) {
+            throw new IllegalStateException("SHA-256 not available", t);
+        }
+    }
+
     /** Hex string to byte array. */
     public static byte[] hexToBytes(String hex) {
         if (hex == null) return new byte[0];

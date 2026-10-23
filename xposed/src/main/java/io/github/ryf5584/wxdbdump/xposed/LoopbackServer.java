@@ -28,25 +28,26 @@ import io.github.ryf5584.wxdbdump.payload.proto.Wire;
  * sides only need INTERNET, and streaming large files works naturally.
  *
  * <p>Binds to 127.0.0.1 only, and a peer must pass both directions of an HMAC handshake
- * before it can issue a command. TOKEN is a build-time constant that ships in the APK and
- * in the repository, so the handshake filters peers that have not read the source rather
- * than authenticating the app; see Handshake and SECURITY.md.
+ * over a single-use 256-bit token before it can issue a command. For each connection's
+ * {@code HELLO} nonce, {@link PeerAuth} verifies the companion app's APK signing certificate
+ * and consumes the one-time token from the app's Binder {@code AuthTokenProvider}
+ * (which checks {@code Binder.getCallingUid()}). See {@link Handshake} and SECURITY.md.
  */
 public final class LoopbackServer {
 
     private final WxDbEngine engine;
     private final int port;
-    private final String token;
+    private final PeerAuth peerAuth;
     private final AtomicBoolean running = new AtomicBoolean(false);
     /** Handshake and per-read deadline for an accepted connection. */
     private static final int HANDSHAKE_TIMEOUT_MS = 15_000;
 
     private ServerSocket server;
 
-    public LoopbackServer(WxDbEngine engine, int port, String token) {
+    public LoopbackServer(WxDbEngine engine, int port, PeerAuth peerAuth) {
         this.engine = engine;
         this.port = port;
-        this.token = token;
+        this.peerAuth = peerAuth;
     }
 
     /** Starts the server. Every exception is swallowed; the module must never crash WeChat. */
@@ -114,10 +115,19 @@ public final class LoopbackServer {
             }
             Log.i("net", "received HELLO nonce=" + nonce);
 
+            // Verify the companion app's APK signature and consume the one-time token bound
+            // to this nonce via Binder IPC (gated by Binder.getCallingUid() == wechatUid).
+            String sessionToken = peerAuth != null ? peerAuth.consumeTokenForNonce(nonce) : null;
+            if (sessionToken == null || sessionToken.isEmpty()) {
+                Log.w("net", "handshake rejected: peer failed APK signature check or issued no valid one-time token");
+                Wire.writeText(out, Handshake.ackBad("UNAUTHORIZED_PEER"));
+                return;
+            }
+
             // The module signs the client nonce, then issues one of its own. Without the second
             // half any peer could open the port and issue DUMP straight away.
             String moduleNonce = Handshake.newNonce();
-            Wire.writeText(out, Handshake.ack(nonce, moduleNonce, token));
+            Wire.writeText(out, Handshake.ack(nonce, moduleNonce, sessionToken));
 
             Wire.Frame authFrame = Wire.read(in);
             String authLine = authFrame.text();
@@ -127,7 +137,7 @@ public final class LoopbackServer {
                 Wire.writeText(out, Handshake.ackBad("BAD_AUTH"));
                 return;
             }
-            if (!Handshake.matches(Handshake.proof(moduleNonce, token),
+            if (!Handshake.matches(Handshake.proof(moduleNonce, sessionToken),
                     Handshake.extractProof(authLine))) {
                 Log.w("net", "handshake failed, AUTH proof mismatch");
                 Wire.writeText(out, Handshake.ackBad("BAD_TOKEN"));

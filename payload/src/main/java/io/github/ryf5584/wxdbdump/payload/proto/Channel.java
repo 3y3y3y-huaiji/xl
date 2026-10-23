@@ -1,31 +1,47 @@
 package io.github.ryf5584.wxdbdump.payload.proto;
 
 /**
- * Loopback channel constants, which the app and the module must agree on.
+ * Loopback channel constants shared by the app and the Xposed module.
  *
- * <p>These are plain Java constants rather than per-module BuildConfig fields, because
- * a library module cannot see the host applicationId and duplicated values drift apart.
- * The port and token live here and nowhere else, so both processes read the same values
- * without a shared file or a ContentProvider.
+ * <p>No static token lives here anymore. Instead, before each loopback connection the app
+ * issues a single-use 256-bit token bound to the client's HELLO nonce in {@link TokenStore},
+ * and the module inside WeChat retrieves and burns that token through the app's Binder
+ * ContentProvider ({@link #AUTH_AUTHORITY}).
  *
- * <p>Security: the socket binds to 127.0.0.1 only and both directions of an HMAC
- * handshake must pass before a command is accepted. Be aware that TOKEN is a build-time
- * constant published with the source, so it filters peers that have not read this
- * repository rather than authenticating the app. See SECURITY.md.
+ * <p>Security properties:
+ * <ul>
+ *   <li>The app's ContentProvider checks {@code Binder.getCallingUid()} (enforced by the
+ *       Linux kernel Binder driver) and only releases a token to WeChat's UID.</li>
+ *   <li>The module inside WeChat checks that the installed {@link #APP_PACKAGE} APK carries
+ *       the exact same signing certificate (SHA-256) as the module APK injected by LSPosed.</li>
+ *   <li>Each token is bound to a single connection nonce, expires within 15 seconds, and is
+ *       erased immediately on first read.</li>
+ * </ul>
  */
 public final class Channel {
 
     /** Loopback port. */
     public static final int PORT = 27183;
 
-    /** Shared handshake secret. */
-    public static final String TOKEN = "9f2c7be41a6d8530c4e1b7a25d309f6c";
+    /** Host application package name. */
+    public static final String APP_PACKAGE = "io.github.ryf5584.wxdbdump";
 
-    /**
-     * Client version, reported in HELLO. Nothing consumes it yet: the server ignores the
-     * field and the client does not check the version it gets back, so a protocol change
-     * would desynchronise silently.
-     */
+    /** Target WeChat package name. */
+    public static final String WECHAT_PACKAGE = "com.tencent.mm";
+
+    /** Binder ContentProvider authority serving single-use handshake tokens to WeChat. */
+    public static final String AUTH_AUTHORITY = APP_PACKAGE + ".auth";
+
+    /** Content URI used for URI permission grants (Android 11+ package visibility) and Binder calls. */
+    public static final String AUTH_URI = "content://" + AUTH_AUTHORITY + "/token";
+
+    /** ContentProvider.call() method that atomically consumes the one-time token for a HELLO nonce. */
+    public static final String AUTH_METHOD_CONSUME = "consume_token";
+
+    /** Bundle key holding the consumed one-time token. */
+    public static final String AUTH_KEY_TOKEN = "token";
+
+    /** Client version, reported in HELLO. */
     public static final String CLIENT_VERSION = "1.0.0";
 
     private Channel() {

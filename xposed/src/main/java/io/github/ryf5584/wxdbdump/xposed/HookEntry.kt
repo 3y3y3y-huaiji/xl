@@ -109,8 +109,9 @@ class WxDbExportHooker : YukiBaseHooker() {
             val report = engine.installHooks()
             Log.i("hook", "hook installation summary: $report")
 
-            // Start the loopback server so the app can detect the module and pull data
-            LoopbackServer(engine, Channel.PORT, Channel.TOKEN).start()
+            // Start the loopback server with Binder UID + APK signature gated one-time tokens
+            val peerAuth = PeerAuth(app, moduleAppFilePath)
+            LoopbackServer(engine, Channel.PORT, peerAuth).start()
         } catch (t: Throwable) {
             // Never crash WeChat
             Log.banner("ENGINE FAILED", Log.stack(t, 20))

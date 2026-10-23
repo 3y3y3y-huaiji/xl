@@ -241,11 +241,11 @@ WeChat DB dump · EnMicroMsg decrypt · SQLCipher page decryption · plaintext S
 
 ## 安全说明
 
-Xposed 模式的回环通道只监听 `127.0.0.1`，并需要双向 HMAC 握手才能下发命令。但
-`TOKEN` 是**构建期常量且随源码公开**，所以握手过滤的是「没读过本仓库的程序」，
-**不等于在认证调用方**。
+Xposed 模式的回环通道只监听 `127.0.0.1`，并采用 **Binder 内核级 UID 鉴权 + 同源 APK 签名校验 + 一次性动态 Token（阅后即焚）** 完成双向 HMAC 握手：
 
-如果你在意同设备上其它 App 的行为，优先用 **Root 模式** —— 它走 `su`，不开任何端口。
+- 每次连接前，主应用在内存中生成绑定当前 `HELLO` nonce 的 256 位一次性随机 Token；
+- 微信内的模块先校验已安装主应用的数字签名（SHA-256）与注入模块自身 APK 签名一致，再通过 `AuthTokenProvider` 获取并立即销毁该一次性 Token；
+- `AuthTokenProvider` 通过 Linux 内核保证的 `Binder.getCallingUid()` 严格校验调用方必须为微信（`com.tencent.mm`），设备上的第三方应用无法获取动态密钥或重放握手。
 
 细节与威胁模型见 [SECURITY.md](SECURITY.md)。
 

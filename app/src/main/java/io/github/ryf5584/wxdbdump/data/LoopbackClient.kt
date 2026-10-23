@@ -1,11 +1,13 @@
 package io.github.ryf5584.wxdbdump.data
 
+import android.content.Context
 import io.github.ryf5584.wxdbdump.core.Account
 import io.github.ryf5584.wxdbdump.core.DbFile
 import io.github.ryf5584.wxdbdump.core.DetectionState
 import io.github.ryf5584.wxdbdump.core.XposedFailure
 import io.github.ryf5584.wxdbdump.payload.Log
 import io.github.ryf5584.wxdbdump.payload.proto.Channel
+import io.github.ryf5584.wxdbdump.payload.proto.Handshake
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -21,16 +23,21 @@ import java.util.concurrent.atomic.AtomicBoolean
 /**
  * Client for Xposed mode, connecting to the loopback server inside WeChat.
  *
- * <p>Module activation is proven rather than guessed: an HMAC challenge-response must
- * complete, so the app never has to read LSPosed's module list. The exchange runs in both
- * directions, because the server also refuses commands until it has verified us.
+ * <p>Module activation and peer authenticity are proven in both directions using a
+ * single-use 256-bit token per connection:
+ * <ol>
+ *   <li>Before sending {@code HELLO}, the client issues a one-time token bound to the fresh
+ *       client nonce in {@link AuthTokenProvider}.</li>
+ *   <li>The module inside WeChat verifies this app's APK signing certificate and consumes
+ *       that one-time token via Binder ({@code Binder.getCallingUid()} gated to WeChat).</li>
+ *   <li>Both sides complete the mutual HMAC-SHA256 challenge-response over the ephemeral token.</li>
+ * </ol>
  *
  * <p>Every failure branch logs a specific reason; the success path logs only milestones.
- * 
  */
 class LoopbackClient(
-    private val port: Int = io.github.ryf5584.wxdbdump.payload.proto.Channel.PORT,
-    private val token: String = io.github.ryf5584.wxdbdump.payload.proto.Channel.TOKEN,
+    private val context: Context? = null,
+    private val port: Int = Channel.PORT,
 ) {
 
     data class ProbeResult(val state: DetectionState, val failure: XposedFailure, val serverInfo: String = "")
@@ -41,6 +48,7 @@ class LoopbackClient(
     suspend fun probe(timeoutMs: Long = 2500): ProbeResult = withContext(Dispatchers.IO) {
         val t0 = System.currentTimeMillis()
         var socket: Socket? = null
+        var issuedNonce: String? = null
         try {
             Log.i("net", "probe 开始 → 127.0.0.1:$port (timeout=${timeoutMs}ms)")
             socket = Socket()
@@ -53,8 +61,10 @@ class LoopbackClient(
             val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
 
             val nonce = newNonce()
-            writeText(out, "HELLO {\"v\":1,\"client\":\"${io.github.ryf5584.wxdbdump.payload.proto.Channel.CLIENT_VERSION}\",\"nonce\":\"$nonce\"}")
-            Log.i("net", "probe 已发 HELLO nonce=$nonce")
+            issuedNonce = nonce
+            val sessionToken = AuthTokenProvider.issueToken(context, nonce)
+            writeText(out, Handshake.hello(Channel.CLIENT_VERSION, nonce))
+            Log.i("net", "probe 已发 HELLO nonce=$nonce (已签发一次性动态 Token)")
 
             val reply = readText(input)
             if (reply == null) {
@@ -68,7 +78,7 @@ class LoopbackClient(
                 return@withContext ProbeResult(DetectionState.Error(reply), XposedFailure.TOKEN_MISMATCH)
             }
             val proof = extract(reply, "proof") ?: ""
-            val expect = hmacProof(nonce, token)
+            val expect = hmacProof(nonce, sessionToken)
             // Log only whether the digests match: a proof is a per-nonce digest, but echoing
             // both halves of a MAC comparison is a habit worth not forming.
             if (!constantTimeEquals(proof, expect)) {
@@ -86,7 +96,7 @@ class LoopbackClient(
                     DetectionState.Error("no server nonce"), XposedFailure.TOKEN_MISMATCH,
                 )
             }
-            writeText(out, "AUTH {\"v\":1,\"proof\":\"${hmacProof(serverNonce, token)}\"}")
+            writeText(out, Handshake.auth(serverNonce, sessionToken))
             val ready = readText(input)
             if (ready == null || !ready.startsWith("READY")) {
                 Log.w("net", "probe failed: AUTH rejected ($ready)")
@@ -102,6 +112,7 @@ class LoopbackClient(
             Log.e("net", "probe 异常（${System.currentTimeMillis() - t0}ms）", t)
             ProbeResult(DetectionState.Unavailable(t.message ?: ""), XposedFailure.CONNECT_FAILED)
         } finally {
+            AuthTokenProvider.revokeToken(issuedNonce)
             if (liveSocket === socket) liveSocket = null
             runCatching { socket?.close() }
         }
@@ -282,6 +293,7 @@ class LoopbackClient(
     }
 
     private fun open(label: String): Triple<Socket, DataOutputStream, DataInputStream>? {
+        var issuedNonce: String? = null
         return try {
             val socket = Socket()
             socket.connect(InetSocketAddress("127.0.0.1", port), 2000)
@@ -291,16 +303,18 @@ class LoopbackClient(
             val out = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
             val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
             val nonce = newNonce()
-            writeText(out, "HELLO {\"v\":1,\"client\":\"${Channel.CLIENT_VERSION}\",\"nonce\":\"$nonce\"}")
+            issuedNonce = nonce
+            val sessionToken = AuthTokenProvider.issueToken(context, nonce)
+            writeText(out, Handshake.hello(Channel.CLIENT_VERSION, nonce))
             val reply = readText(input)
             if (reply == null) {
                 Log.w("net", "[$label] handshake failed: no ACK from the server")
                 return null
             }
-            // The ACK proves the module holds the token; the server then challenges us back,
-            // so we answer with a proof over its nonce before it will serve any command.
+            // The ACK proves the module holds the one-time token; the server then challenges us
+            // back, so we answer with a proof over its nonce before it will serve any command.
             val serverProof = extract(reply, "proof")
-            if (!constantTimeEquals(hmacProof(nonce, token), serverProof)) {
+            if (!constantTimeEquals(hmacProof(nonce, sessionToken), serverProof)) {
                 Log.w("net", "[$label] handshake failed: ACK proof mismatch")
                 return null
             }
@@ -309,7 +323,7 @@ class LoopbackClient(
                 Log.w("net", "[$label] handshake failed: ACK carried no nonce")
                 return null
             }
-            writeText(out, "AUTH {\"v\":1,\"proof\":\"${hmacProof(serverNonce, token)}\"}")
+            writeText(out, Handshake.auth(serverNonce, sessionToken))
             val ready = readText(input)
             if (ready == null || !ready.startsWith("READY")) {
                 Log.w("net", "[$label] handshake failed: server rejected AUTH ($ready)")
@@ -319,6 +333,8 @@ class LoopbackClient(
         } catch (t: Throwable) {
             Log.e("net", "[$label] 建连/握手异常（127.0.0.1:$port）", t)
             null
+        } finally {
+            AuthTokenProvider.revokeToken(issuedNonce)
         }
     }
 

@@ -6,6 +6,7 @@
 -keep class io.github.ryf5584.wxdbdump.xposed.HookEntry* { *; }
 -keep class io.github.ryf5584.wxdbdump.xposed.WcdbKeyHooks { *; }
 -keep class io.github.ryf5584.wxdbdump.xposed.LoopbackServer { *; }
+-keep class io.github.ryf5584.wxdbdump.xposed.PeerAuth { *; }
 -keep class io.github.ryf5584.wxdbdump.xposed.WxDbEngine { *; }
 -keep class io.github.ryf5584.wxdbdump.xposed.XposedHost { *; }
 -keepclassmembers class * { @androidx.annotation.Keep *; }
