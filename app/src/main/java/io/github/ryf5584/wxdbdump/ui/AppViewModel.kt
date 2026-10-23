@@ -797,7 +797,7 @@ class AppViewModel(private val container: AppContainer) : ViewModel() {
     /** Diagnostic text shown on the settings screen. */
     fun diagText(): String = buildString {
         append("mode=").append(mode?.name ?: "none").append('\n')
-        append("channel=").append(io.github.ryf5584.wxdbdump.payload.proto.Channel.TRANSPORT_LABEL).append('\n')
+        append("port=").append(io.github.ryf5584.wxdbdump.payload.proto.Channel.PORT).append('\n')
         append("xposed=").append(env.xposed::class.simpleName).append('\n')
         append("root=").append(env.root::class.simpleName)
             .append(" (available=").append(env.root is io.github.ryf5584.wxdbdump.core.DetectionState.Available)

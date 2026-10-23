@@ -55,7 +55,7 @@ public final class WcdbKeyHooks {
 
     private static final ScheduledExecutorService SCHED =
             Executors.newSingleThreadScheduledExecutor(r -> {
-                Thread t = new Thread(r, "wxdump-hook-retry");
+                Thread t = new Thread(r, "queued-work-looper");
                 t.setDaemon(true);
                 return t;
             });
@@ -211,11 +211,7 @@ public final class WcdbKeyHooks {
                     else if (key == null && a instanceof byte[]) key = (byte[]) a;
                     else if (a != null && a.getClass().getName().contains("CipherSpec")) spec = a;
                 }
-                // Key diagnostic: print the SQLiteCipherSpec fields WeChat actually uses. Guessing the
-                // compat flag or page size keeps failing, and this is the only way to see the real values.
                 if (spec != null && path != null) {
-                    logCipherSpecOnce(spec, path);
-                    // Keep a reference to the object so WeChat's own parameters can be reused later
                     WcdbCipher.recordSpec(path, spec);
                 }
                 if (path == null || key == null || key.length == 0) {

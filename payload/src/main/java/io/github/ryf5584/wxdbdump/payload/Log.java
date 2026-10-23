@@ -27,10 +27,21 @@ public final class Log {
     /** Process label, e.g. app or com.tencent.mm. */
     private static volatile String proc = "?";
 
+    /**
+     * Stealth mode for the hooked host process: when true, nothing is written to android.util.Log
+     * or System.out, preventing the host app's anti-tamper SDK from scanning its own logcat buffer.
+     */
+    private static volatile boolean silentExternal = false;
+
     private static volatile Method logV, logD, logI, logW, logE;
     private static volatile boolean logReady = false;
 
     private Log() {
+    }
+
+    /** Enables or disables external logcat/stdout emission (enabled in WeChat for stealth). */
+    public static void setSilentExternal(boolean silent) {
+        silentExternal = silent;
     }
 
     public interface Sink {
@@ -169,14 +180,16 @@ public final class Log {
         } catch (Throwable ignored) {
         }
 
-        try {
-            toLogcat(level, tag, msg);
-        } catch (Throwable ignored) {
-        }
+        if (!silentExternal) {
+            try {
+                toLogcat(level, tag, msg);
+            } catch (Throwable ignored) {
+            }
 
-        try {
-            System.out.println(TAG + " [" + proc + "][" + tag + "] " + level + ": " + msg);
-        } catch (Throwable ignored) {
+            try {
+                System.out.println(TAG + " [" + proc + "][" + tag + "] " + level + ": " + msg);
+            } catch (Throwable ignored) {
+            }
         }
 
         for (Sink s : SINKS) {

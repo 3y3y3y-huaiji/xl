@@ -1,61 +1,64 @@
 package io.github.ryf5584.wxdbdump.payload.proto;
 
+import java.io.BufferedReader;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
+
+import io.github.ryf5584.wxdbdump.payload.Digest;
+
 /**
- * Unix domain SocketPair + Binder channel constants shared by the app and the Xposed module.
+ * Zero-IPC stealth loopback channel configuration.
  *
- * <p>Instead of opening a TCP loopback port on {@code 127.0.0.1} or relying on a static
- * build-time token, this channel establishes an authenticated kernel {@code AF_UNIX}
- * stream socket pair ({@code ParcelFileDescriptor.createSocketPair()}) per session over
- * Android Binder IPC:
- * <ol>
- *   <li>The app registers a short-lived single-use {@code requestId} in
- *       {@code SocketBridgeProvider} and wakes the module inside WeChat via an explicit
- *       foreground broadcast ({@link #ACTION_CONNECT}).</li>
- *   <li>The module inside WeChat verifies that the installed {@link #APP_PACKAGE} APK
- *       carries the exact same signing certificate (SHA-256) as the injected module APK,
- *       creates an {@code AF_UNIX} socket pair, and hands the client file descriptor to
- *       {@link #BRIDGE_AUTHORITY} via {@code ContentResolver.call()}.</li>
- *   <li>{@code SocketBridgeProvider} verifies {@code Binder.getCallingUid()} belongs to
- *       {@link #WECHAT_PACKAGE}, accepts the socket descriptor, and returns a single-use
- *       256-bit session token in the Binder reply.</li>
- *   <li>Both ends immediately close the unused descriptor copy and run the mutual HMAC
- *       handshake and {@link Wire} framing over the private kernel socket pair.</li>
- * </ol>
+ * <p>Why zero Binder/PackageManager calls inside WeChat:
+ * Making cross-package {@code PackageManager}, {@code ContentResolver}, or
+ * {@code registerReceiver} calls from inside WeChat's process exposes the module's package
+ * name and class instances to WeChat's hooked Binder proxies and {@code mLoadedApk} tables.
+ *
+ * <p>Instead, at build time Gradle generates a cryptographically random port in
+ * {@code 32000..58000} and a 256-bit secret into an internal JAR resource shared only by
+ * the app and module packaged inside the same APK. Neither the port nor the secret appears
+ * in source control, and the module inside WeChat makes zero Android IPC or PackageManager
+ * calls.
  */
 public final class Channel {
 
-    /** Transport descriptor shown in diagnostics (no TCP port is opened). */
-    public static final String TRANSPORT_LABEL = "unix-socketpair://binder";
+    private static final String RESOURCE_PATH = "/META-INF/services/jdk.internal.pref";
 
-    /** Host application package name. */
-    public static final String APP_PACKAGE = "io.github.ryf5584.wxdbdump";
+    /** Per-build randomized loopback port. */
+    public static final int PORT;
 
-    /** Target WeChat package name. */
-    public static final String WECHAT_PACKAGE = "com.tencent.mm";
-
-    /** Binder ContentProvider authority brokering AF_UNIX socket pairs and one-time tokens. */
-    public static final String BRIDGE_AUTHORITY = APP_PACKAGE + ".bridge";
-
-    /** Content URI used for URI permission grants (Android 11+ visibility) and Binder calls. */
-    public static final String BRIDGE_URI = "content://" + BRIDGE_AUTHORITY + "/session";
-
-    /** Explicit broadcast action sent to WeChat to request a fresh AF_UNIX socket pair. */
-    public static final String ACTION_CONNECT = APP_PACKAGE + ".action.CONNECT";
-
-    /** Broadcast Intent extra carrying the one-time connection request id. */
-    public static final String EXTRA_REQUEST_ID = "request_id";
-
-    /** ContentProvider.call() method invoked by the module inside WeChat to attach a socket pair. */
-    public static final String BRIDGE_METHOD_ATTACH = "attach_socket";
-
-    /** Bundle key holding the ParcelFileDescriptor for the companion app end of the socket pair. */
-    public static final String BRIDGE_KEY_FD = "fd";
-
-    /** Bundle key holding the single-use 256-bit handshake token returned by the provider. */
-    public static final String BRIDGE_KEY_TOKEN = "token";
+    /** Per-build 256-bit handshake secret derived from the embedded build seed. */
+    public static final String TOKEN;
 
     /** Client version, reported in HELLO. */
     public static final String CLIENT_VERSION = "1.0.0";
+
+    static {
+        int resolvedPort = 41893;
+        String resolvedToken = Digest.sha256Hex("fallback-build-seed".getBytes(StandardCharsets.UTF_8));
+        try (InputStream in = Channel.class.getResourceAsStream(RESOURCE_PATH)) {
+            if (in != null) {
+                BufferedReader br = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8));
+                String line = br.readLine();
+                if (line != null) {
+                    String[] parts = line.trim().split(":", 2);
+                    if (parts.length == 2) {
+                        int p = Integer.parseInt(parts[0].trim());
+                        String t = parts[1].trim();
+                        if (p >= 1024 && p <= 65535 && t.length() >= 32) {
+                            resolvedPort = p;
+                            resolvedToken = Digest.sha256Hex(
+                                    (p + ":" + t + ":stealth-v1").getBytes(StandardCharsets.UTF_8));
+                        }
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        PORT = resolvedPort;
+        TOKEN = resolvedToken;
+    }
 
     private Channel() {
     }
