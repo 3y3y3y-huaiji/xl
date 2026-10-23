@@ -345,7 +345,7 @@ public final class LoopbackServer {
             }
 
             case "VERIFY": {
-                PlainDumper.Result r = engine.verifyPlain(arg);
+                PlainDumper.Result r = engine.inspectPlain(arg);
                 if (r.ok) {
                     Wire.writeText(out, "{\"ok\":true,\"size\":" + r.size + ",\"plaintext\":true}");
                 } else {
@@ -355,19 +355,17 @@ public final class LoopbackServer {
             }
 
             case "DUMP": {
-                PlainDumper.Result probe = engine.verifyPlain(arg);
-                if (!probe.ok) {
-                    Wire.writeText(out, "{\"ok\":false,\"reason\":\"" + esc(String.valueOf(probe.reason)) + "\"}");
+                PlainDumper.Result r = engine.inspectPlain(arg);
+                if (!r.ok) {
+                    Wire.writeText(out, "{\"ok\":false,\"reason\":\"" + esc(String.valueOf(r.reason)) + "\"}");
                     return true;
                 }
-                Wire.writeText(out, "{\"ok\":true,\"size\":" + probe.size + ",\"plaintext\":true}");
-                FramedChunkOutputStream framedOut = new FramedChunkOutputStream(out);
-                PlainDumper.Result streamed = engine.streamPlain(arg, framedOut);
-                framedOut.flush();
-                if (!streamed.ok) {
-                    Log.w("net", "DUMP stream interrupted: " + streamed.reason);
-                    return false;
-                }
+                Wire.writeText(out, "{\"ok\":true,\"size\":" + r.size + ",\"plaintext\":true}");
+                engine.streamPlain(arg, r, (chunk, len) -> {
+                    byte[] slice = new byte[len];
+                    System.arraycopy(chunk, 0, slice, 0, len);
+                    Wire.writeBytes(out, slice);
+                });
                 Wire.writeText(out, "END");
                 return true;
             }
