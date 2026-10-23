@@ -2,7 +2,6 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
@@ -61,6 +60,17 @@
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_paths" />
         </provider>
+
+        <!--
+          Binder endpoint that receives kernel AF_UNIX SocketPair descriptors from WeChat and
+          returns single-use 256-bit handshake tokens. SocketBridgeProvider checks
+          Binder.getCallingUid() and rejects any caller other than com.tencent.mm.
+        -->
+        <provider
+            android:name=".data.SocketBridgeProvider"
+            android:authorities="${applicationId}.bridge"
+            android:exported="true"
+            android:grantUriPermissions="true" />
 
     </application>
 

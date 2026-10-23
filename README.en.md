@@ -207,14 +207,6 @@ On Android 11+ without "All files access" the app falls back to its private dire
 Grant the permission from the settings screen to export to a public folder.
 </details>
 
-<details>
-<summary><b>Why does it need the INTERNET permission? Does it phone home?</b></summary>
-
-No. Xposed mode talks to the module over a loopback socket, and Android counts loopback as network access, so the permission is required. The server binds to `127.0.0.1` only and never listens on an external address.
-
-Root mode does not use that channel at all and opens no port.
-</details>
-
 ---
 
 ## Author
@@ -239,13 +231,15 @@ Xposed module · root extraction · KernelSU · Magisk · WCDB decrypt · 微信
 
 ## Security
 
-The Xposed channel's loopback server binds to `127.0.0.1` and requires a two-way HMAC
-handshake before it will accept a command. `TOKEN` is a build-time constant published with
-the source, however, so the handshake filters peers that have not read this repository
-rather than authenticating the caller.
+The Xposed channel opens **zero TCP or abstract socket ports** and does not require the
+`INTERNET` permission. Instead, each session uses a dedicated kernel `AF_UNIX` stream
+socket pair (`ParcelFileDescriptor.createSocketPair()`) delivered over Android Binder IPC:
 
-Prefer **root mode** if you do not trust the other apps on the device: it reads through
-`su` and opens no port at all.
+- The module inside WeChat verifies that the installed app APK shares the exact same
+  signing certificate (SHA-256) as the injected module APK before creating a socket pair;
+- `SocketBridgeProvider` in the app verifies `Binder.getCallingUid() == wechatUid` at the
+  kernel level before accepting the descriptor and returning a single-use 256-bit token for
+  the mutual HMAC handshake.
 
 See [SECURITY.md](SECURITY.md) for the full threat model.
 

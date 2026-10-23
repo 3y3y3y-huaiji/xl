@@ -1,14 +1,17 @@
 package io.github.ryf5584.wxdbdump.xposed;
 
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.os.Build;
+import android.os.ParcelFileDescriptor;
+
 import java.io.BufferedOutputStream;
 import java.io.DataInputStream;
 import java.io.File;
 import java.io.FileInputStream;
-import java.net.InetAddress;
-import java.net.ServerSocket;
-import java.net.Socket;
 import java.util.List;
-import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import io.github.ryf5584.wxdbdump.payload.Digest;
@@ -17,86 +20,91 @@ import io.github.ryf5584.wxdbdump.payload.engine.KeyVault;
 import io.github.ryf5584.wxdbdump.payload.discovery.DatabaseEnumerator;
 import io.github.ryf5584.wxdbdump.payload.model.Account;
 import io.github.ryf5584.wxdbdump.payload.model.DbFile;
+import io.github.ryf5584.wxdbdump.payload.proto.Channel;
 import io.github.ryf5584.wxdbdump.payload.proto.Handshake;
 import io.github.ryf5584.wxdbdump.payload.proto.Wire;
 
 /**
- * Loopback server inside WeChat's process. It is the only channel through which the app
+ * Unix domain SocketPair server inside WeChat's process.
  *
- * <p>Why loopback TCP instead of a LocalSocket: cross-uid LocalSocket connections are
- * restricted by SELinux, while loopback TCP is unaffected by uid or scoped storage. Both
- * sides only need INTERNET, and streaming large files works naturally.
+ * <p>No TCP port or {@code LocalServerSocket} is opened. Instead, when the companion app
+ * requests a session via {@link Channel#ACTION_CONNECT}, {@link PeerAuth} verifies the
+ * companion app's APK signing certificate (SHA-256), creates a kernel {@code AF_UNIX}
+ * stream socket pair ({@link ParcelFileDescriptor#createSocketPair()}), and hands the
+ * client descriptor to {@code SocketBridgeProvider} over Binder (which enforces
+ * {@code Binder.getCallingUid() == wechatUid}).
  *
- * <p>Binds to 127.0.0.1 only, and a peer must pass both directions of an HMAC handshake
- * before it can issue a command. TOKEN is a build-time constant that ships in the APK and
- * in the repository, so the handshake filters peers that have not read the source rather
- * than authenticating the app; see Handshake and SECURITY.md.
+ * <p>Both sides then run the mutual HMAC handshake over the single-use 256-bit token
+ * returned by the provider before any command is accepted.
  */
 public final class LoopbackServer {
 
     private final WxDbEngine engine;
-    private final int port;
-    private final String token;
+    private final PeerAuth peerAuth;
     private final AtomicBoolean running = new AtomicBoolean(false);
-    /** Handshake and per-read deadline for an accepted connection. */
-    private static final int HANDSHAKE_TIMEOUT_MS = 15_000;
+    private BroadcastReceiver connectReceiver;
 
-    private ServerSocket server;
-
-    public LoopbackServer(WxDbEngine engine, int port, String token) {
+    public LoopbackServer(WxDbEngine engine, PeerAuth peerAuth) {
         this.engine = engine;
-        this.port = port;
-        this.token = token;
+        this.peerAuth = peerAuth;
     }
 
-    /** Starts the server. Every exception is swallowed; the module must never crash WeChat. */
+    /** Registers the session-request receiver inside WeChat. Never crashes the host process. */
+    @SuppressWarnings("UnspecifiedRegisterReceiverFlag")
     public void start() {
         if (!running.compareAndSet(false, true)) return;
-        Thread t = new Thread(this::acceptLoop, "wxdump-loopback");
-        t.setDaemon(true);
-        t.start();
+        try {
+            Context ctx = peerAuth.hostContext();
+            IntentFilter filter = new IntentFilter(Channel.ACTION_CONNECT);
+            connectReceiver = new BroadcastReceiver() {
+                @Override
+                public void onReceive(Context context, Intent intent) {
+                    if (!running.get() || intent == null) return;
+                    if (!Channel.ACTION_CONNECT.equals(intent.getAction())) return;
+                    final String reqId = intent.getStringExtra(Channel.EXTRA_REQUEST_ID);
+                    if (reqId == null || reqId.isEmpty()) return;
+                    Thread h = new Thread(() -> connectAndHandle(reqId), "wxdump-unix-conn");
+                    h.setDaemon(true);
+                    h.start();
+                }
+            };
+            if (Build.VERSION.SDK_INT >= 33) {
+                // Context.RECEIVER_EXPORTED = 0x2
+                ctx.registerReceiver(connectReceiver, filter, 0x2);
+            } else {
+                ctx.registerReceiver(connectReceiver, filter);
+            }
+            Log.i("net", "unix socketpair bridge registered on action=" + Channel.ACTION_CONNECT);
+        } catch (Throwable t) {
+            Log.e("net", "failed to register unix socketpair bridge receiver", t);
+            running.set(false);
+        }
     }
 
     public void stop() {
         running.set(false);
         try {
-            if (server != null) server.close();
+            if (connectReceiver != null) {
+                peerAuth.hostContext().unregisterReceiver(connectReceiver);
+                connectReceiver = null;
+            }
         } catch (Throwable ignored) {
         }
     }
 
-    private void acceptLoop() {
-        try {
-            server = new ServerSocket(port, 8, InetAddress.getByName("127.0.0.1"));
-            Log.i("net", "loopback server listening on 127.0.0.1:" + port);
-        } catch (Throwable t) {
-            Log.e("net", "loopback server failed to start, port=" + port, t);
-            running.set(false);
+    private void connectAndHandle(String requestId) {
+        PeerAuth.SocketSession session = peerAuth.establishSocketSession(requestId);
+        if (session == null) {
             return;
         }
-        while (running.get()) {
-            try {
-                final Socket s = server.accept();
-                Thread h = new Thread(() -> handle(s), "wxdump-conn");
-                h.setDaemon(true);
-                h.start();
-            } catch (Throwable t) {
-                if (running.get()) Log.w("net", "accept failed: " + t);
-            }
-        }
+        handle(session.serverPfd, session.sessionToken);
     }
 
-    private void handle(Socket s) {
+    private void handle(ParcelFileDescriptor pfd, String sessionToken) {
         long t0 = System.currentTimeMillis();
-        try {
-            s.setTcpNoDelay(true);
-            // Without a read timeout a peer can connect and then stall, holding its thread
-            // inside WeChat's process indefinitely. Commands are authenticated; resources
-            // are not, and a single local app could open connections until the process dies.
-            s.setSoTimeout(HANDSHAKE_TIMEOUT_MS);
-            DataInputStream in = new DataInputStream(s.getInputStream());
-            BufferedOutputStream out = new BufferedOutputStream(s.getOutputStream());
-            Log.i("net", "new connection " + s.getRemoteSocketAddress());
+        try (DataInputStream in = new DataInputStream(new ParcelFileDescriptor.AutoCloseInputStream(pfd));
+             BufferedOutputStream out = new BufferedOutputStream(new ParcelFileDescriptor.AutoCloseOutputStream(pfd))) {
+            Log.i("net", "accepted AF_UNIX socketpair session");
 
             // ---- Handshake ----
             Wire.Frame f = Wire.read(in);
@@ -114,10 +122,8 @@ public final class LoopbackServer {
             }
             Log.i("net", "received HELLO nonce=" + nonce);
 
-            // The module signs the client nonce, then issues one of its own. Without the second
-            // half any peer could open the port and issue DUMP straight away.
             String moduleNonce = Handshake.newNonce();
-            Wire.writeText(out, Handshake.ack(nonce, moduleNonce, token));
+            Wire.writeText(out, Handshake.ack(nonce, moduleNonce, sessionToken));
 
             Wire.Frame authFrame = Wire.read(in);
             String authLine = authFrame.text();
@@ -127,17 +133,17 @@ public final class LoopbackServer {
                 Wire.writeText(out, Handshake.ackBad("BAD_AUTH"));
                 return;
             }
-            if (!Handshake.matches(Handshake.proof(moduleNonce, token),
+            if (!Handshake.matches(Handshake.proof(moduleNonce, sessionToken),
                     Handshake.extractProof(authLine))) {
                 Log.w("net", "handshake failed, AUTH proof mismatch");
                 Wire.writeText(out, Handshake.ackBad("BAD_TOKEN"));
                 return;
             }
             Wire.writeText(out, Handshake.ready());
-            Log.i("net", "handshake complete, commands accepted");
+            Log.i("net", "handshake complete over AF_UNIX socketpair, commands accepted");
 
             // ---- Command loop ----
-            while (running.get() && !s.isClosed()) {
+            while (running.get()) {
                 Wire.Frame cmd = Wire.read(in);
                 if (cmd.type != Wire.TYPE_TEXT) {
                     Log.d("net", "ignoring a non-text frame, type=" + cmd.type);
@@ -149,10 +155,10 @@ public final class LoopbackServer {
             }
         } catch (Throwable t) {
             // Connection closed; a client-side close lands here and is normal
-            Log.i("net", "connection closed after " + (System.currentTimeMillis() - t0) + "ms: " + t);
+            Log.i("net", "session closed after " + (System.currentTimeMillis() - t0) + "ms: " + t);
         } finally {
             try {
-                s.close();
+                pfd.close();
             } catch (Throwable ignored) {
             }
         }

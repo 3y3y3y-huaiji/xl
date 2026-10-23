@@ -207,15 +207,6 @@ Android 11+ 未授予「所有文件访问」时会自动回退到应用私有�
 在设置页点「去授权」授予权限后即可导出到公共目录。
 </details>
 
-<details>
-<summary><b>为什么要 INTERNET 权限？会联网吗？</b></summary>
-
-不会联网。Xposed 模式靠一个回环 socket 让应用和模块通信，而回环 socket 在 Android 上也算网络，
-所以必须声明 `INTERNET`。服务端只 bind 到 `127.0.0.1`，不监听任何外部地址。
-
-Root 模式完全不用这个通道，不开任何端口。
-</details>
-
 ---
 
 ## 作者
@@ -241,11 +232,10 @@ WeChat DB dump · EnMicroMsg decrypt · SQLCipher page decryption · plaintext S
 
 ## 安全说明
 
-Xposed 模式的回环通道只监听 `127.0.0.1`，并需要双向 HMAC 握手才能下发命令。但
-`TOKEN` 是**构建期常量且随源码公开**，所以握手过滤的是「没读过本仓库的程序」，
-**不等于在认证调用方**。
+Xposed 模式完全**不监听任何 TCP 或本地端口**（甚至不需要声明 `INTERNET` 权限），而是采用 **Binder 传递内核级 `AF_UNIX` 域套接字对（`ParcelFileDescriptor.createSocketPair()`）+ 内核 UID 鉴权 + 同源 APK 签名校验 + 一次性动态 Token**：
 
-如果你在意同设备上其它 App 的行为，优先用 **Root 模式** —— 它走 `su`，不开任何端口。
+- 绕开 Android SELinux 对跨 UID `LocalServerSocket` 直接 `connect` 的限制，改为由微信内模块校验主应用同源 APK 数字签名（SHA-256）后创建 `AF_UNIX` 套接字对，并通过 Binder `ContentProvider` 将文件描述符递交主应用；
+- 主应用在 `SocketBridgeProvider` 中通过 Linux 内核保证的 `Binder.getCallingUid()` 严格校验调用方必须为微信（`com.tencent.mm`），并在同一 Binder 响应中签发 256 位一次性动态 Token 完成双向 HMAC 握手。
 
 细节与威胁模型见 [SECURITY.md](SECURITY.md)。
 

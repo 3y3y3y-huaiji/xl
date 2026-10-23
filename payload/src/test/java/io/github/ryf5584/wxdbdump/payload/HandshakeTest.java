@@ -13,8 +13,7 @@ import org.junit.jupiter.api.Test;
 import io.github.ryf5584.wxdbdump.payload.proto.Handshake;
 
 /**
- * The handshake is the only thing standing between another app on the device and the
- * decrypted databases, so its edge cases are worth pinning down.
+ * Mutual HMAC-SHA256 handshake over the per-session AF_UNIX SocketPair token.
  */
 class HandshakeTest {
 
@@ -62,19 +61,26 @@ class HandshakeTest {
     }
 
     @Test
-    @DisplayName("a proof cannot be produced when the inputs are missing")
+    @DisplayName("a proof cannot be produced when the inputs are missing or empty")
     void proofRefusesMissingInputs() {
         assertNull(Handshake.proof(null, TOKEN));
+        assertNull(Handshake.proof("", TOKEN));
         assertNull(Handshake.proof("nonce", null));
+        assertNull(Handshake.proof("nonce", ""));
     }
 
     @Test
-    @DisplayName("nonces differ between calls")
-    void noncesAreNotRepeated() {
+    @DisplayName("nonces and tokens differ between calls and have expected entropy")
+    void noncesAndTokensAreNotRepeated() {
         String a = Handshake.newNonce();
         assertNotNull(a);
         assertEquals(32, a.length(), "16 bytes as hex");
         assertNotEquals(a, Handshake.newNonce());
+
+        String t1 = Handshake.newToken();
+        assertNotNull(t1);
+        assertEquals(64, t1.length(), "32 bytes (256-bit) as hex");
+        assertNotEquals(t1, Handshake.newToken());
     }
 
     @Test

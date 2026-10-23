@@ -1,11 +1,14 @@
 package io.github.ryf5584.wxdbdump.data
 
+import android.content.Context
+import android.os.ParcelFileDescriptor
 import io.github.ryf5584.wxdbdump.core.Account
 import io.github.ryf5584.wxdbdump.core.DbFile
 import io.github.ryf5584.wxdbdump.core.DetectionState
 import io.github.ryf5584.wxdbdump.core.XposedFailure
 import io.github.ryf5584.wxdbdump.payload.Log
 import io.github.ryf5584.wxdbdump.payload.proto.Channel
+import io.github.ryf5584.wxdbdump.payload.proto.Handshake
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -14,46 +17,46 @@ import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.DataInputStream
 import java.io.DataOutputStream
-import java.net.InetSocketAddress
-import java.net.Socket
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Client for Xposed mode, connecting to the loopback server inside WeChat.
+ * Client for Xposed mode, communicating over a kernel {@code AF_UNIX} SocketPair brokered
+ * via Android Binder ({@link SocketBridgeProvider}).
  *
- * <p>Module activation is proven rather than guessed: an HMAC challenge-response must
- * complete, so the app never has to read LSPosed's module list. The exchange runs in both
- * directions, because the server also refuses commands until it has verified us.
- *
- * <p>Every failure branch logs a specific reason; the success path logs only milestones.
- * 
+ * <p>Zero TCP ports are opened and {@code INTERNET} permission is not needed. Every
+ * connection creates a dedicated {@code AF_UNIX} stream socket pair whose peer is verified
+ * at the kernel level via {@code Binder.getCallingUid()} and APK signing certificate
+ * comparison, followed by a mutual HMAC-SHA256 challenge-response over a single-use 256-bit
+ * token.
  */
 class LoopbackClient(
-    private val port: Int = io.github.ryf5584.wxdbdump.payload.proto.Channel.PORT,
-    private val token: String = io.github.ryf5584.wxdbdump.payload.proto.Channel.TOKEN,
+    private val context: Context? = null,
 ) {
 
     data class ProbeResult(val state: DetectionState, val failure: XposedFailure, val serverInfo: String = "")
 
     private val busy = AtomicBoolean()
 
-    /** Probes connectivity, handshake and version. Failures carry an exact reason. */
+    /** Probes connectivity, Binder socketpair attachment, mutual handshake, and version. */
     suspend fun probe(timeoutMs: Long = 2500): ProbeResult = withContext(Dispatchers.IO) {
         val t0 = System.currentTimeMillis()
-        var socket: Socket? = null
+        var session: SocketBridgeProvider.ClientSession? = null
         try {
-            Log.i("net", "probe 开始 → 127.0.0.1:$port (timeout=${timeoutMs}ms)")
-            socket = Socket()
-            socket.connect(InetSocketAddress("127.0.0.1", port), timeoutMs.toInt().coerceAtLeast(300))
-            socket.soTimeout = timeoutMs.toInt().coerceAtLeast(300)
-            socket.tcpNoDelay = true
-            Log.i("net", "probe connect OK（${System.currentTimeMillis() - t0}ms）")
+            Log.i("net", "probe 开始 → ${Channel.TRANSPORT_LABEL} (timeout=${timeoutMs}ms)")
+            session = SocketBridgeProvider.requestSession(context, timeoutMs)
+            if (session == null) {
+                Log.w("net", "probe 失败：微信内模块未响应 AF_UNIX SocketPair 握手（${System.currentTimeMillis() - t0}ms）")
+                return@withContext ProbeResult(DetectionState.Unavailable(), XposedFailure.CONNECT_FAILED)
+            }
+            livePfd = session.pfd
+            Log.i("net", "probe AF_UNIX SocketPair 已就绪（${System.currentTimeMillis() - t0}ms）")
 
-            val out = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
-            val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
+            val out = DataOutputStream(BufferedOutputStream(ParcelFileDescriptor.AutoCloseOutputStream(session.pfd)))
+            val input = DataInputStream(BufferedInputStream(ParcelFileDescriptor.AutoCloseInputStream(session.pfd)))
+            val sessionToken = session.sessionToken
 
             val nonce = newNonce()
-            writeText(out, "HELLO {\"v\":1,\"client\":\"${io.github.ryf5584.wxdbdump.payload.proto.Channel.CLIENT_VERSION}\",\"nonce\":\"$nonce\"}")
+            writeText(out, Handshake.hello(Channel.CLIENT_VERSION, nonce))
             Log.i("net", "probe 已发 HELLO nonce=$nonce")
 
             val reply = readText(input)
@@ -63,14 +66,11 @@ class LoopbackClient(
             }
             Log.i("net", "probe 收到：" + head(reply))
             if (!reply.startsWith("ACK")) {
-                // NACK means our server answered but rejected the handshake
                 Log.w("net", "probe 失败：服务端返回非 ACK（$reply）")
                 return@withContext ProbeResult(DetectionState.Error(reply), XposedFailure.TOKEN_MISMATCH)
             }
             val proof = extract(reply, "proof") ?: ""
-            val expect = hmacProof(nonce, token)
-            // Log only whether the digests match: a proof is a per-nonce digest, but echoing
-            // both halves of a MAC comparison is a habit worth not forming.
+            val expect = hmacProof(nonce, sessionToken)
             if (!constantTimeEquals(proof, expect)) {
                 Log.w("net", "probe failed: ACK proof mismatch")
                 return@withContext ProbeResult(
@@ -78,7 +78,6 @@ class LoopbackClient(
                 )
             }
 
-            // The server issues its own nonce and will not serve a command until we sign it.
             val serverNonce = extract(reply, "nonce")
             if (serverNonce == null) {
                 Log.w("net", "probe failed: ACK carried no nonce")
@@ -86,7 +85,7 @@ class LoopbackClient(
                     DetectionState.Error("no server nonce"), XposedFailure.TOKEN_MISMATCH,
                 )
             }
-            writeText(out, "AUTH {\"v\":1,\"proof\":\"${hmacProof(serverNonce, token)}\"}")
+            writeText(out, Handshake.auth(serverNonce, sessionToken))
             val ready = readText(input)
             if (ready == null || !ready.startsWith("READY")) {
                 Log.w("net", "probe failed: AUTH rejected ($ready)")
@@ -95,15 +94,15 @@ class LoopbackClient(
                 )
             }
 
-            val status = exec(socket, out, input, "STATUS") ?: ""
+            val status = exec(out, input, "STATUS") ?: ""
             Log.i("net", "probe 成功（${System.currentTimeMillis() - t0}ms）STATUS=" + head(status))
             return@withContext ProbeResult(DetectionState.Available, XposedFailure.NONE, status)
         } catch (t: Throwable) {
             Log.e("net", "probe 异常（${System.currentTimeMillis() - t0}ms）", t)
             ProbeResult(DetectionState.Unavailable(t.message ?: ""), XposedFailure.CONNECT_FAILED)
         } finally {
-            if (liveSocket === socket) liveSocket = null
-            runCatching { socket?.close() }
+            if (livePfd === session?.pfd) livePfd = null
+            runCatching { session?.close() }
         }
     }
 
@@ -112,8 +111,8 @@ class LoopbackClient(
         onProgress: (Int, Int, String) -> Unit = { _, _, _ -> },
     ): List<Account> = withContext(Dispatchers.IO) {
         Log.i("net", "→ ACCOUNTS")
-        val json = withConnection("ACCOUNTS") { socket, out, input ->
-            exec(socket, out, input, "ACCOUNTS", onProgress)
+        val json = withConnection("ACCOUNTS") { _, out, input ->
+            exec(out, input, "ACCOUNTS", onProgress)
         }
         if (json == null) {
             Log.w("net", "ACCOUNTS 返回 null（连接或命令失败，见上面的错误日志）")
@@ -130,8 +129,8 @@ class LoopbackClient(
         onProgress: (Int, Int, String) -> Unit = { _, _, _ -> },
     ): List<DbFile> = withContext(Dispatchers.IO) {
         Log.i("net", "→ DBS $dirName")
-        val json = withConnection("DBS") { socket, out, input ->
-            exec(socket, out, input, "DBS $dirName", onProgress)
+        val json = withConnection("DBS") { _, out, input ->
+            exec(out, input, "DBS $dirName", onProgress)
         }
         if (json == null) {
             Log.w("net", "DBS 返回 null（连接或命令失败）")
@@ -145,7 +144,7 @@ class LoopbackClient(
     /** Generic request-response command on the control plane. */
     suspend fun rawRequest(cmd: String): String? = withContext(Dispatchers.IO) {
         val op = cmd.substringBefore(' ')
-        withConnection(op) { socket, out, input -> exec(socket, out, input, cmd) }
+        withConnection(op) { _, out, input -> exec(out, input, cmd) }
     }
 
     /** Streams the raw ciphertext of a database into [sink]. */
@@ -168,13 +167,13 @@ class LoopbackClient(
         onProgress: (Long) -> Unit,
     ): Boolean = withContext(Dispatchers.IO) {
         val t0 = System.currentTimeMillis()
-        var socket: Socket? = null
+        var pfd: ParcelFileDescriptor? = null
         try {
             val conn = open(op) ?: run {
                 Log.w("net", "$op 终止：无法建立连接 path=$path")
                 return@withContext false
             }
-            socket = conn.first
+            pfd = conn.first
             val out = conn.second
             val input = conn.third
             writeText(out, "$op $path")
@@ -231,8 +230,8 @@ class LoopbackClient(
             Log.e("net", "$op 异常 path=$path", t)
             false
         } finally {
-            if (liveSocket === socket) liveSocket = null
-            runCatching { socket?.close() }
+            if (livePfd === pfd) livePfd = null
+            runCatching { pfd?.close() }
         }
     }
 
@@ -240,39 +239,37 @@ class LoopbackClient(
 
     private suspend fun <T> withConnection(
         label: String,
-        block: (Socket, DataOutputStream, DataInputStream) -> T,
+        block: (ParcelFileDescriptor, DataOutputStream, DataInputStream) -> T,
     ): T? = withContext(Dispatchers.IO) {
-        var socket: Socket? = null
+        var pfd: ParcelFileDescriptor? = null
         try {
             val conn = open(label) ?: return@withContext null
-            socket = conn.first
+            pfd = conn.first
             block(conn.first, conn.second, conn.third)
         } catch (t: Throwable) {
             Log.e("net", "$label 命令异常", t)
             null
         } finally {
-            if (liveSocket === socket) liveSocket = null
-            runCatching { socket?.close() }
+            if (livePfd === pfd) livePfd = null
+            runCatching { pfd?.close() }
         }
     }
 
     /**
-     * Socket of the command currently in flight, if any.
+     * Descriptor of the command currently in flight, if any.
      *
-     * <p>SO_TIMEOUT only bounds a single read, and coroutine cancellation cannot interrupt a
-     * blocking socket read at all. A watchdog therefore has to close the socket to make the
-     * read fail immediately; [abortActive] is that handle.
+     * <p>Closing the descriptor tears down the kernel AF_UNIX socket pair and unblocks any
+     * thread waiting on a blocking read.
      */
     @Volatile
-    private var liveSocket: java.net.Socket? = null
+    private var livePfd: ParcelFileDescriptor? = null
 
     /** Closes the in-flight connection, unblocking whoever is reading from it. */
     fun abortActive() {
-        runCatching { liveSocket?.close() }
-        liveSocket = null
+        runCatching { livePfd?.close() }
+        livePfd = null
     }
 
-    /** Connects and performs the handshake. Every failure branch logs a reason. */
     /** Constant-time compare, so a wrong proof cannot be discovered byte by byte. */
     private fun constantTimeEquals(a: String?, b: String?): Boolean {
         if (a == null || b == null || a.length != b.length) return false
@@ -281,43 +278,49 @@ class LoopbackClient(
         return diff == 0
     }
 
-    private fun open(label: String): Triple<Socket, DataOutputStream, DataInputStream>? {
+    private fun open(label: String): Triple<ParcelFileDescriptor, DataOutputStream, DataInputStream>? {
+        var session: SocketBridgeProvider.ClientSession? = null
         return try {
-            val socket = Socket()
-            socket.connect(InetSocketAddress("127.0.0.1", port), 2000)
-            socket.soTimeout = 30000
-            socket.tcpNoDelay = true
-            liveSocket = socket
-            val out = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
-            val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
+            session = SocketBridgeProvider.requestSession(context, 3000L) ?: run {
+                Log.w("net", "[$label] failed to establish AF_UNIX SocketPair via Binder")
+                return null
+            }
+            val pfd = session.pfd
+            val sessionToken = session.sessionToken
+            livePfd = pfd
+            val out = DataOutputStream(BufferedOutputStream(ParcelFileDescriptor.AutoCloseOutputStream(pfd)))
+            val input = DataInputStream(BufferedInputStream(ParcelFileDescriptor.AutoCloseInputStream(pfd)))
             val nonce = newNonce()
-            writeText(out, "HELLO {\"v\":1,\"client\":\"${Channel.CLIENT_VERSION}\",\"nonce\":\"$nonce\"}")
+            writeText(out, Handshake.hello(Channel.CLIENT_VERSION, nonce))
             val reply = readText(input)
             if (reply == null) {
                 Log.w("net", "[$label] handshake failed: no ACK from the server")
+                session.close()
                 return null
             }
-            // The ACK proves the module holds the token; the server then challenges us back,
-            // so we answer with a proof over its nonce before it will serve any command.
             val serverProof = extract(reply, "proof")
-            if (!constantTimeEquals(hmacProof(nonce, token), serverProof)) {
+            if (!constantTimeEquals(hmacProof(nonce, sessionToken), serverProof)) {
                 Log.w("net", "[$label] handshake failed: ACK proof mismatch")
+                session.close()
                 return null
             }
             val serverNonce = extract(reply, "nonce")
             if (serverNonce == null) {
                 Log.w("net", "[$label] handshake failed: ACK carried no nonce")
+                session.close()
                 return null
             }
-            writeText(out, "AUTH {\"v\":1,\"proof\":\"${hmacProof(serverNonce, token)}\"}")
+            writeText(out, Handshake.auth(serverNonce, sessionToken))
             val ready = readText(input)
             if (ready == null || !ready.startsWith("READY")) {
                 Log.w("net", "[$label] handshake failed: server rejected AUTH ($ready)")
+                session.close()
                 return null
             }
-            Triple(socket, out, input)
+            Triple(pfd, out, input)
         } catch (t: Throwable) {
-            Log.e("net", "[$label] 建连/握手异常（127.0.0.1:$port）", t)
+            Log.e("net", "[$label] 建连/握手异常（${Channel.TRANSPORT_LABEL}）", t)
+            runCatching { session?.close() }
             null
         }
     }
@@ -329,7 +332,6 @@ class LoopbackClient(
      * Progress frames are consumed and reported; only the result frame returns.
      */
     private fun exec(
-        socket: Socket,
         out: DataOutputStream,
         input: DataInputStream,
         cmd: String,
@@ -365,10 +367,10 @@ class LoopbackClient(
      */
     suspend fun fetchBytes(op: String, arg: String, maxBytes: Int = 4 * 1024 * 1024): ByteArray? =
         withContext(Dispatchers.IO) {
-            var socket: Socket? = null
+            var pfd: ParcelFileDescriptor? = null
             try {
                 val conn = open(op) ?: return@withContext null
-                socket = conn.first
+                pfd = conn.first
                 val out = conn.second
                 val input = conn.third
                 writeText(out, "$op $arg")
@@ -400,7 +402,7 @@ class LoopbackClient(
                 Log.w("net", "$op 异常", t)
                 null
             } finally {
-                runCatching { socket?.close() }
+                runCatching { pfd?.close() }
             }
         }
 
@@ -488,20 +490,10 @@ class LoopbackClient(
         /** Prefix marking a progress frame rather than a result. */
         private const val PROGRESS_PREFIX = "#P "
 
-        fun newNonce(): String {
-            val b = ByteArray(16)
-            java.security.SecureRandom().nextBytes(b)
-            return b.joinToString("") { "%02x".format(it) }
-        }
+        fun newNonce(): String = Handshake.newNonce()
 
-        fun hmacProof(nonce: String, token: String): String = runCatching {
-            val mac = javax.crypto.Mac.getInstance("HmacSHA256")
-            mac.init(javax.crypto.spec.SecretKeySpec(token.toByteArray(), "HmacSHA256"))
-            mac.doFinal(nonce.toByteArray()).joinToString("") { "%02x".format(it) }
-        }.getOrElse {
-            Log.e("net", "HmacSHA256 计算失败", it)
-            ""
-        }
+        fun hmacProof(nonce: String, token: String): String =
+            Handshake.proof(nonce, token) ?: ""
 
         private fun head(s: String?, max: Int = 120): String {
             if (s == null) return "null"

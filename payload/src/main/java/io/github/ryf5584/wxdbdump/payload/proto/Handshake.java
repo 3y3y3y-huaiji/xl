@@ -9,32 +9,17 @@ import javax.crypto.spec.SecretKeySpec;
 import io.github.ryf5584.wxdbdump.payload.Digest;
 
 /**
- * Loopback handshake.
+ * Mutual HMAC-SHA256 handshake over an authenticated kernel {@code AF_UNIX} socket pair.
  *
- * <p>Two independent directions run over one connection:
+ * <p>Even though the {@code AF_UNIX} file descriptor is delivered over Binder with kernel
+ * {@code Binder.getCallingUid()} and APK signature verification, both ends still run a
+ * mutual challenge-response over the per-session 256-bit token before any command is sent:
  * <pre>
  *   app    -&gt; HELLO {v:1, client:"1.0.0", nonce:"&lt;app nonce&gt;"}
- *   module -&gt; ACK   {v:1, proof:"hmac(TOKEN, app nonce)", nonce:"&lt;module nonce&gt;"}
- *   app    -&gt; AUTH  {v:1, proof:"hmac(TOKEN, module nonce)"}
+ *   module -&gt; ACK   {v:1, proof:"hmac(sessionToken, app nonce)", nonce:"&lt;module nonce&gt;"}
+ *   app    -&gt; AUTH  {v:1, proof:"hmac(sessionToken, module nonce)"}
  *   module -&gt; READY {"ok":true}
  * </pre>
- *
- * <p>The ACK proves to the app that the module is present and holds the token, so the app
- * never has to read LSPosed's module list. The AUTH does the same in reverse: the module
- * refuses commands until the peer has proven it also holds the token, so a client that
- * simply opens the port and sends {@code DUMP} gets nothing.
- *
- * <h3>What this does not cover</h3>
- *
- * <p>TOKEN is a build-time constant that ships in the APK and in this repository, so AUTH
- * only filters out peers that have not read the source. It does not authenticate the app:
- * a malicious app on the same device that knows the token can still complete the
- * handshake. Closing that gap needs a per-install secret, and app and module run under
- * different uids with no shared writable location, so it needs a pairing step that does
- * not exist yet. See SECURITY.md.
- *
- * <p>Loopback TCP rather than a LocalSocket because cross-uid LocalSocket connections are
- * restricted by SELinux, while loopback TCP is unaffected by uid or scoped storage.
  */
 public final class Handshake {
 
@@ -83,7 +68,7 @@ public final class Handshake {
      * {@code AUTH {"proof":""}} through.
      */
     public static String proof(String nonceHex, String token) {
-        if (nonceHex == null || token == null) return null;
+        if (nonceHex == null || nonceHex.isEmpty() || token == null || token.isEmpty()) return null;
         try {
             Mac mac = Mac.getInstance("HmacSHA256");
             mac.init(new SecretKeySpec(token.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
@@ -94,9 +79,16 @@ public final class Handshake {
         }
     }
 
-    /** Generates a 16-byte random nonce as hex. */
+    /** Generates a 16-byte (128-bit) random nonce as 32 lowercase hex characters. */
     public static String newNonce() {
         byte[] b = new byte[16];
+        RANDOM.nextBytes(b);
+        return Digest.bytesToHex(b);
+    }
+
+    /** Generates a 32-byte (256-bit) random one-time token as 64 lowercase hex characters. */
+    public static String newToken() {
+        byte[] b = new byte[32];
         RANDOM.nextBytes(b);
         return Digest.bytesToHex(b);
     }
@@ -119,7 +111,7 @@ public final class Handshake {
         return s != null && s.startsWith("AUTH");
     }
 
-    /** Constant-time comparison, so a wrong proof cannot be found byte by byte. */
+    /** Constant-time comparison, so a wrong proof or digest cannot be found byte by byte. */
     public static boolean matches(String expected, String actual) {
         if (expected == null || actual == null || expected.isEmpty()) return false;
         if (expected.length() != actual.length()) return false;
