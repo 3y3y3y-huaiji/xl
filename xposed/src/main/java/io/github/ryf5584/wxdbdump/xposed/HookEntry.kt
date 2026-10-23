@@ -87,16 +87,16 @@ class HookEntry : IYukiHookXposedInit {
 
         try {
             val host = XposedHost(app, loader, process)
-            val engine = WxDbEngine(host)
-            this.engine = engine
+            val eng = WxDbEngine(host)
+            engine = eng
 
-            val hookSummary = engine.installHooks()
+            val hookSummary = eng.installHooks()
 
             if (isMain) {
                 val peerAuth = PeerAuth(app)
-                val s = LoopbackServer(engine, Channel.PORT, peerAuth)
+                val s = LoopbackServer(eng, Channel.PORT, peerAuth)
                 s.start()
-                this.server = s
+                server = s
             }
             Log.banner(
                 "WECHAT READY",
